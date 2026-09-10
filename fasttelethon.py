@@ -28,6 +28,50 @@ except ImportError:
 
 log: logging.Logger = logging.getLogger("telethon")
 
+# Monkey-patch Telethon's Connection._recv_loop to prevent "RuntimeError: coroutine ignored GeneratorExit"
+# on Python 3.12+ when connections or tasks are cancelled during GC or loop shutdown.
+import telethon.network.connection.connection as telethon_conn
+
+_orig_recv_loop = telethon_conn.Connection._recv_loop
+
+async def _safe_recv_loop(self):
+    is_gen_exit = False
+    try:
+        while self._connected:
+            try:
+                data = await self._recv()
+            except asyncio.CancelledError:
+                break
+            except (IOError, asyncio.IncompleteReadError) as e:
+                self._log.warning('Server closed the connection: %s', e)
+                await self._recv_queue.put((None, e))
+                await self.disconnect()
+            except telethon_conn.InvalidChecksumError as e:
+                self._log.warning('Server response had invalid checksum: %s', e)
+                await self._recv_queue.put((None, e))
+            except telethon_conn.InvalidBufferError as e:
+                self._log.warning('Server response had invalid buffer: %s', e)
+                await self._recv_queue.put((None, e))
+            except Exception as e:
+                self._log.exception('Unexpected exception in the receive loop')
+                await self._recv_queue.put((None, e))
+                await self.disconnect()
+            else:
+                await self._recv_queue.put((data, None))
+    except GeneratorExit:
+        is_gen_exit = True
+        self._connected = False
+        return
+    finally:
+        if not is_gen_exit:
+            try:
+                await self.disconnect()
+            except Exception:
+                pass
+
+telethon_conn.Connection._recv_loop = _safe_recv_loop
+
+
 TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLocation,
                      InputFileLocation, InputPhotoFileLocation]
 
@@ -55,8 +99,11 @@ class DownloadSender:
         self.request.offset += self.stride
         return result.bytes
 
-    def disconnect(self) -> Awaitable[None]:
-        return self.sender.disconnect()
+    async def disconnect(self) -> None:
+        try:
+            await self.sender.disconnect()
+        except Exception:
+            pass
 
 
 class UploadSender:
@@ -98,9 +145,15 @@ class UploadSender:
         await self.client._call(self.sender, request)
 
     async def disconnect(self) -> None:
-        if self.previous:
-            await self.previous
-        return await self.sender.disconnect()
+        if self.previous and not self.previous.done():
+            try:
+                await self.previous
+            except Exception:
+                pass
+        try:
+            await self.sender.disconnect()
+        except Exception:
+            pass
 
 
 class ParallelTransferrer:
@@ -122,8 +175,9 @@ class ParallelTransferrer:
 
     async def _cleanup(self) -> None:
         if self.senders:
-            await asyncio.gather(*[sender.disconnect() for sender in self.senders if sender], return_exceptions=True)
+            to_disconnect = self.senders
             self.senders = None
+            await asyncio.gather(*[sender.disconnect() for sender in to_disconnect if sender], return_exceptions=True)
 
     @staticmethod
     def _get_connection_count(file_size: int, max_count: int = 4,
@@ -262,25 +316,27 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
     part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
 
     try:
-        response.seek(0)
-    except Exception:
-        pass
+        try:
+            response.seek(0)
+        except Exception:
+            pass
 
-    pos = 0
-    while True:
-        data = response.read(part_size)
-        if not data:
-            break
-        if not is_large:
-            hash_md5.update(data)
-        await uploader.upload(data)
-        pos += len(data)
-        if progress_callback:
-            r = progress_callback(pos, file_size)
-            if inspect.isawaitable(r):
-                await r
+        pos = 0
+        while True:
+            data = response.read(part_size)
+            if not data:
+                break
+            if not is_large:
+                hash_md5.update(data)
+            await uploader.upload(data)
+            pos += len(data)
+            if progress_callback:
+                r = progress_callback(pos, file_size)
+                if inspect.isawaitable(r):
+                    await r
+    finally:
+        await uploader.finish_upload()
 
-    await uploader.finish_upload()
     file_name = os.path.basename(response.name)
     if is_large:
         return InputFileBig(file_id, part_count, file_name), file_size
@@ -297,13 +353,16 @@ async def download_file(client: TelegramClient,
     dc_id, location = utils.get_input_location(location)
     # We lock the transfers because telegram has connection count limits
     downloader = ParallelTransferrer(client, dc_id)
-    downloaded = downloader.download(location, size)
-    async for x in downloaded:
-        out.write(x)
-        if progress_callback:
-            r = progress_callback(out.tell(), size)
-            if inspect.isawaitable(r):
-                await r
+    try:
+        downloaded = downloader.download(location, size)
+        async for x in downloaded:
+            out.write(x)
+            if progress_callback:
+                r = progress_callback(out.tell(), size)
+                if inspect.isawaitable(r):
+                    await r
+    finally:
+        await downloader._cleanup()
 
     return out
 
@@ -331,15 +390,28 @@ async def upload_stream(client: TelegramClient,
     uploader = ParallelTransferrer(client)
     part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
 
-    pos = 0
-    buffer = bytearray()
-    async for chunk in stream:
-        if not chunk:
-            continue
-        buffer.extend(chunk)
-        while len(buffer) >= part_size:
-            part = bytes(buffer[:part_size])
-            del buffer[:part_size]
+    try:
+        pos = 0
+        buffer = bytearray()
+        async for chunk in stream:
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            while len(buffer) >= part_size:
+                part = bytes(buffer[:part_size])
+                del buffer[:part_size]
+                if not is_large:
+                    hash_md5.update(part)
+                await uploader.upload(part)
+                pos += len(part)
+                if progress_callback:
+                    r = progress_callback(pos, file_size)
+                    if inspect.isawaitable(r):
+                        await r
+
+        if buffer:
+            part = bytes(buffer)
+            buffer.clear()
             if not is_large:
                 hash_md5.update(part)
             await uploader.upload(part)
@@ -348,24 +420,14 @@ async def upload_stream(client: TelegramClient,
                 r = progress_callback(pos, file_size)
                 if inspect.isawaitable(r):
                     await r
+    finally:
+        await uploader.finish_upload()
 
-    if buffer:
-        part = bytes(buffer)
-        buffer.clear()
-        if not is_large:
-            hash_md5.update(part)
-        await uploader.upload(part)
-        pos += len(part)
-        if progress_callback:
-            r = progress_callback(pos, file_size)
-            if inspect.isawaitable(r):
-                await r
-
-    await uploader.finish_upload()
     if is_large:
         return InputFileBig(file_id, part_count, file_name), file_size
     else:
         return InputFile(file_id, part_count, file_name, hash_md5.hexdigest()), file_size
+
 
 
 async def upload_http_stream(client: TelegramClient,

@@ -1608,4 +1608,21 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    client.loop.run_until_complete(main())
+    try:
+        client.loop.run_until_complete(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        try:
+            if client.is_connected():
+                client.loop.run_until_complete(client.disconnect())
+        except Exception:
+            pass
+        try:
+            pending = [t for t in asyncio.all_tasks(client.loop) if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                client.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
