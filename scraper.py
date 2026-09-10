@@ -594,6 +594,102 @@ async def resolve_bunkr_direct_url(f_url: str, headers: dict, client: httpx.Asyn
             await client.aclose()
 
 
+async def resolve_media_stream_info(domain: str, video: dict, client: httpx.AsyncClient = None) -> dict:
+    """
+    Resolves real direct CDN URL, headers, filename, and checks Content-Length
+    for streaming without downloading the payload to disk.
+    """
+    url = video.get("url") or video.get("bunkr_f_url")
+    referer = f"https://{domain}/"
+    headers = get_headers(domain, referer, is_media=True)
+
+    # 1. If Bunkr, resolve direct CDN signed URL dynamically
+    if video.get("service") == "bunkr" or video.get("bunkr_f_url") or "bunkr" in domain:
+        f_url = video.get("bunkr_f_url") or url
+        try:
+            url, resolved_name = await resolve_bunkr_direct_url(f_url, headers, client=client)
+            if resolved_name:
+                video["name"] = sanitize(resolved_name)
+            logger.info(f"Resolved Bunkr direct URL for streaming: {f_url} -> {url[:60]}...")
+            headers["Referer"] = BUNKR_DL_REFERER
+            headers["Origin"] = "https://bunkr.cr"
+            headers["Sec-Fetch-Site"] = "cross-site"
+            headers["Accept"] = "*/*"
+        except Exception as e:
+            logger.error(f"Failed to resolve Bunkr direct URL for {f_url}: {e}")
+            return {"status": "error_html", "error": str(e)}
+
+    # 2. Resolve redirects
+    resolved_url = await resolve_redirect_url(url, headers)
+    if resolved_url and resolved_url != url:
+        logger.info(f"Redirect resolved: {url} -> {resolved_url}")
+        url = resolved_url
+        cdn_host = urlparse(url).netloc
+        headers = get_headers(cdn_host, referer, is_media=True)
+        if any(x in cdn_host.lower() for x in ["bunkr", "balbums", "cdn.cr"]):
+            headers["Referer"] = BUNKR_DL_REFERER
+            headers["Origin"] = "https://bunkr.cr"
+            headers["Sec-Fetch-Site"] = "cross-site"
+
+    # 3. Probe headers to get Content-Length and validate status
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30.0)
+        close_client = True
+
+    try:
+        # Send lightweight stream request to inspect response headers without downloading body
+        req_headers = headers.copy()
+        if any(x in url.lower() for x in ["bunkr", "balbums", "cdn.cr"]):
+            req_headers["Referer"] = BUNKR_DL_REFERER
+            req_headers["Origin"] = "https://bunkr.cr"
+
+        async with client.stream("GET", url, headers=req_headers, timeout=30) as resp:
+            if resp.status_code in (401, 403, 404):
+                logger.error(f"HTTP {resp.status_code} error when inspecting {video.get('name')}")
+                return {"status": "error_html", "error": f"HTTP {resp.status_code}"}
+
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "text/html" in content_type:
+                logger.error(f"Skipping {video.get('name')} (Received HTML instead of media)")
+                return {"status": "error_html", "error": "HTML response"}
+
+            total_server_size = 0
+            content_range = resp.headers.get("Content-Range", "")
+            if content_range and "/" in content_range:
+                try:
+                    total_server_size = int(content_range.split("/")[-1])
+                except ValueError:
+                    total_server_size = 0
+            elif "Content-Length" in resp.headers:
+                try:
+                    total_server_size = int(resp.headers.get("Content-Length", 0))
+                except ValueError:
+                    total_server_size = 0
+
+            if total_server_size > MAX_FILE_SIZE:
+                logger.warning(f"Skipping {video.get('name')} (Size: {total_server_size} bytes exceeds 2000MB limit)")
+                return {"status": "skipped_size", "file_size": total_server_size}
+
+            if 0 < total_server_size < MIN_FILE_SIZE:
+                logger.warning(f"Skipping {video.get('name')} (Size: {total_server_size} bytes too small, likely broken)")
+                return {"status": "skipped_small", "file_size": total_server_size}
+
+            return {
+                "status": "ok",
+                "url": url,
+                "headers": req_headers,
+                "name": video.get("name") or "video.mp4",
+                "file_size": total_server_size
+            }
+    except Exception as e:
+        logger.error(f"Error inspecting media stream for {video.get('name')}: {e}")
+        return {"status": "error_html", "error": str(e)}
+    finally:
+        if close_client:
+            await client.aclose()
+
+
 async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 0, client: httpx.AsyncClient = None, progress_callback: Callable = None) -> str | bool:
     """Download video with resume support and progress bar (asynchronous)."""
     url = video["url"]

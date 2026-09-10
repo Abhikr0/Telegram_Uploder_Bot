@@ -32,10 +32,12 @@ if sys.platform == "win32":
         pass
 
 # Import fasttelethon from local file
-from fasttelethon import upload_file
+from fasttelethon import upload_file, upload_http_stream
 
 # Import AI caption & metadata generator
 from ai_caption import generate_ai_caption
+
+import httpx
 
 # Import scraper functions
 from scraper import (
@@ -44,7 +46,8 @@ from scraper import (
     parse_page_range, 
     fetch_all_posts, 
     extract_video_urls, 
-    download_video
+    download_video,
+    resolve_media_stream_info
 )
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -57,6 +60,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", 0))
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "bot_downloads")
+ENABLE_STREAM_UPLOAD = os.getenv("ENABLE_STREAM_UPLOAD", "true").lower() in ("true", "1", "yes")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
@@ -113,7 +117,13 @@ BAR_MANAGER = BarPositionManager()
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_admin(user_id):
-    return not ADMIN_IDS or user_id in ADMIN_IDS
+    try:
+        load_dotenv(override=True)
+        raw_admins = os.getenv("ADMIN_IDS", "")
+        admin_list = [int(x.strip()) for x in raw_admins.split(",") if x.strip()]
+        return not admin_list or user_id in admin_list
+    except Exception:
+        return not ADMIN_IDS or user_id in ADMIN_IDS
 
 async def check_admin_or_notify(event):
     if is_admin(event.sender_id):
@@ -219,6 +229,65 @@ async def generate_thumbnail(filepath, thumb_path):
     except Exception as e:
         logger.warning(f"Thumbnail generation failed for {filepath}: {e}")
         return False
+
+
+async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_path: Path) -> tuple[dict, bool]:
+    """
+    Extracts video metadata (duration, width, height) and generates a thumbnail
+    directly from an HTTP URL using imageio_ffmpeg in 1-2 seconds without downloading the whole file.
+    """
+    meta = {'duration': 0, 'width': 0, 'height': 0}
+    has_thumb = False
+    try:
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+
+        hdr_args = []
+        if headers:
+            headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            hdr_args = ["-headers", headers_str]
+
+        thumb_cmd = [
+            ffmpeg_cmd, "-y",
+            *hdr_args,
+            "-ss", "00:00:01.000",
+            "-i", url,
+            "-vframes", "1",
+            "-q:v", "2",
+            str(thumb_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *thumb_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+            output = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
+            dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
+            if dur_match:
+                h, m, s = dur_match.groups()
+                meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
+            vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
+            if vid_match:
+                meta['width'] = int(vid_match.group(1))
+                meta['height'] = int(vid_match.group(2))
+            has_thumb = thumb_path.exists()
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            logger.debug(f"ffmpeg stream probing timed out for {url[:50]}")
+    except Exception as e:
+        logger.debug(f"Stream thumbnail/metadata extraction failed: {e}")
+
+    return meta, has_thumb
+
 
 def render_album_browser(user_id: int):
     """Render the paginated album files selector with checkbox toggles and rich field previews."""
@@ -362,9 +431,9 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
             while state["running"]:
                 processed = state["uploaded"] + state["skipped"] + state["failed"]
                 text = (
-                    f"📊 <b>Pipeline Progress:</b>\n"
+                    f"📊 <b>Pipeline Progress ({'⚡ RAM Stream' if ENABLE_STREAM_UPLOAD else '💾 Disk Pipeline'}):</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📥 <b>Downloaded:</b> {state['downloaded']}/{state['total']} videos\n"
+                    f"📥 <b>Processed:</b> {state['downloaded']}/{state['total']} videos\n"
                     f"📤 <b>Uploaded:</b> {state['uploaded']}/{state['total']} videos\n"
                 )
                 if state["skipped"] > 0:
@@ -398,12 +467,12 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
         status_task = asyncio.create_task(status_updater())
 
-        # Bounded pipeline queue (at most 3 files on disk to prevent disk exhaustion)
-        upload_queue = asyncio.Queue(maxsize=3)
-
-        # Download worker function
-        async def download_worker(vid):
-            pos = await BAR_MANAGER.get_pos()
+        # Pipeline worker definitions
+        async def disk_pipeline_worker(vid, pos=None):
+            need_release = False
+            if pos is None:
+                pos = await BAR_MANAGER.get_pos()
+                need_release = True
             vid_name = vid.get('name') or vid.get('title') or "video"
             state["active_downloads"][vid_name] = "<code>[Connecting...] ⏳</code>"
 
@@ -413,6 +482,9 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     state["active_downloads"][vid_name] = get_progress_bar(current, total)
                     last_dl_pbar_time[0] = time.time()
 
+            filepath = None
+            thumb_path = None
+            has_thumb = False
             try:
                 download_res = await download_video(
                     domain, vid, temp_dir, pos=pos, progress_callback=dl_progress_callback
@@ -421,121 +493,350 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     state["skipped"] += 1
                     return
                 filepath = temp_dir / f"{vid['id']}_{vid['name']}"
-                if download_res and filepath.exists():
-                    state["downloaded"] += 1
-                    await upload_queue.put((vid, filepath))
-                else:
+                if not (download_res and filepath.exists()):
                     state["failed"] += 1
+                    return
+
+                state["downloaded"] += 1
+                state["active_downloads"].pop(vid_name, None)
+
+                # Upload phase
+                file_size = filepath.stat().st_size
+                state["active_uploads"][vid['name']] = "<code>[Processing Metadata...] ⚙️</code>"
+
+                last_pbar_time = [0.0]
+                async def progress_callback(current, total):
+                    if time.time() - last_pbar_time[0] > 3:
+                        state["active_uploads"][vid['name']] = get_progress_bar(current, total)
+                        last_pbar_time[0] = time.time()
+
+                metadata = get_video_metadata(filepath)
+                thumb_path = filepath.with_suffix('.jpg')
+                has_thumb = await generate_thumbnail(filepath, thumb_path)
+                attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
+
+                # Prepare rich caption & metadata (via Mistral AI)
+                ai_meta = await generate_ai_caption(vid, service, cur_user_id)
+                rich_caption = ai_meta["rich_caption"]
+                db_title = ai_meta["db_title"]
+
+                sent_msg = None
+                for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                    try:
+                        with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [UP] {vid['name'][:20]}", position=pos, leave=False) as t_pbar:
+                            async def upload_progress(current, total):
+                                await progress_callback(current, total)
+                                t_pbar.n = current
+                                t_pbar.refresh()
+                            with open(filepath, "rb") as f:
+                                uploaded_file = await upload_file(client, f, progress_callback=upload_progress)
+                            sent_msg = await client.send_file(
+                                target_channel_id,
+                                uploaded_file,
+                                caption=rich_caption,
+                                parse_mode='html',
+                                supports_streaming=True,
+                                attributes=attributes,
+                                thumb=str(thumb_path) if has_thumb else None,
+                                video=True
+                            )
+                        break
+                    except Exception as e:
+                        if attempt == MAX_UPLOAD_RETRIES:
+                            raise e
+                        logger.warning(f"Upload attempt {attempt} failed for {vid['name']}: {e}. Retrying in {RETRY_DELAY}s...")
+                        await asyncio.sleep(RETRY_DELAY)
+
+                # Automated indexing into Supabase if configured
+                if sent_msg and supabase_client:
+                    try:
+                        db_entry = {
+                            "id": str(uuid.uuid4()),
+                            "title": db_title[:150],
+                            "file_id": "mtproto_uploaded",
+                            "message_id": sent_msg.id,
+                            "file_size": file_size,
+                            "upload_date": datetime.now(timezone.utc).isoformat()
+                        }
+                        await asyncio.to_thread(supabase_client.table("media").insert(db_entry).execute)
+                        logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {sent_msg.id})")
+                    except Exception as db_err:
+                        logger.warning(f"Supabase auto-index error: {db_err}")
+
+                state["uploaded"] += 1
+            except Exception as e:
+                logger.error(f"Error processing {vid_name}: {e}")
+                state["failed"] += 1
             finally:
                 state["active_downloads"].pop(vid_name, None)
+                state["active_uploads"].pop(vid['name'], None)
+                if has_thumb and thumb_path and thumb_path.exists():
+                    try: os.remove(thumb_path)
+                    except Exception: pass
+                if filepath and filepath.exists():
+                    try: os.remove(filepath)
+                    except Exception: pass
+                if need_release:
+                    await BAR_MANAGER.release_pos(pos)
+
+        async def stream_pipeline_worker(vid):
+            pos = await BAR_MANAGER.get_pos()
+            vid_name = vid.get('name') or vid.get('title') or "video"
+            state["active_uploads"][vid_name] = "<code>[Connecting Stream...] ⏳</code>"
+
+            last_pbar_time = [0.0]
+            async def progress_callback(current, total):
+                if time.time() - last_pbar_time[0] >= 2.0:
+                    state["active_uploads"][vid_name] = get_progress_bar(current, total)
+                    last_pbar_time[0] = time.time()
+
+            thumb_path = None
+            has_thumb = False
+            try:
+                info = await resolve_media_stream_info(domain, vid)
+                status = info.get("status")
+
+                if status in ["skipped_size", "skipped_small"]:
+                    state["skipped"] += 1
+                    return
+                elif status == "error_html" or not info.get("url") or not info.get("file_size"):
+                    logger.warning(f"Stream resolution unavailable for {vid_name} ({info.get('error', 'no length')}). Falling back to disk pipeline...")
+                    await disk_pipeline_worker(vid, pos)
+                    return
+
+                stream_url = info["url"]
+                stream_headers = info["headers"]
+                file_size = info["file_size"]
+                stream_filename = info.get("name") or f"{vid['id']}_{vid_name}"
+
+                state["active_uploads"][vid_name] = "<code>[Probing Stream...] ⚙️</code>"
+                thumb_path = temp_dir / f"{vid['id']}_thumb.jpg"
+                meta, has_thumb = await generate_stream_thumbnail_and_metadata(stream_url, stream_headers, thumb_path)
+
+                if not has_thumb and vid.get("thumbnail"):
+                    try:
+                        async with httpx.AsyncClient(timeout=15.0) as thumb_client:
+                            t_resp = await thumb_client.get(vid["thumbnail"])
+                            if t_resp.status_code == 200 and len(t_resp.content) > 1000:
+                                thumb_path.write_bytes(t_resp.content)
+                                has_thumb = True
+                    except Exception:
+                        pass
+
+                attributes = [DocumentAttributeVideo(
+                    duration=meta.get('duration', 0),
+                    w=meta.get('width', 0),
+                    h=meta.get('height', 0),
+                    supports_streaming=True
+                )]
+
+                ai_meta = await generate_ai_caption(vid, service, cur_user_id)
+                rich_caption = ai_meta["rich_caption"]
+                db_title = ai_meta["db_title"]
+
+                state["active_uploads"][vid_name] = "<code>[Streaming to Telegram...] 🚀</code>"
+
+                sent_msg = None
+                for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                    try:
+                        with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [STREAM] {vid_name[:20]}", position=pos, leave=False) as t_pbar:
+                            async def upload_progress(current, total):
+                                await progress_callback(current, total)
+                                t_pbar.n = current
+                                t_pbar.refresh()
+
+                            uploaded_file, _ = await upload_http_stream(
+                                client=client,
+                                url=stream_url,
+                                file_name=stream_filename,
+                                headers=stream_headers,
+                                progress_callback=upload_progress
+                            )
+                            sent_msg = await client.send_file(
+                                target_channel_id,
+                                uploaded_file,
+                                caption=rich_caption,
+                                parse_mode='html',
+                                supports_streaming=True,
+                                attributes=attributes,
+                                thumb=str(thumb_path) if has_thumb else None,
+                                video=True
+                            )
+                        break
+                    except Exception as e:
+                        if attempt == MAX_UPLOAD_RETRIES:
+                            logger.warning(f"Stream upload failed for {vid_name} after {MAX_UPLOAD_RETRIES} attempts: {e}. Falling back to disk pipeline...")
+                            await disk_pipeline_worker(vid, pos)
+                            return
+                        logger.warning(f"Stream attempt {attempt} failed for {vid_name}: {e}. Retrying in {RETRY_DELAY}s...")
+                        await asyncio.sleep(RETRY_DELAY)
+
+                if sent_msg and supabase_client:
+                    try:
+                        db_entry = {
+                            "id": str(uuid.uuid4()),
+                            "title": db_title[:150],
+                            "file_id": "mtproto_uploaded",
+                            "message_id": sent_msg.id,
+                            "file_size": file_size,
+                            "upload_date": datetime.now(timezone.utc).isoformat()
+                        }
+                        await asyncio.to_thread(supabase_client.table("media").insert(db_entry).execute)
+                        logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {sent_msg.id})")
+                    except Exception as db_err:
+                        logger.warning(f"Supabase auto-index error: {db_err}")
+
+                state["uploaded"] += 1
+                state["downloaded"] += 1
+            except Exception as e:
+                logger.error(f"Error in stream pipeline for {vid_name}: {e}")
+                state["failed"] += 1
+            finally:
+                state["active_uploads"].pop(vid_name, None)
+                if has_thumb and thumb_path and thumb_path.exists():
+                    try: os.remove(thumb_path)
+                    except Exception: pass
                 await BAR_MANAGER.release_pos(pos)
 
-        # Upload consumer worker
-        async def upload_worker():
-            while state["running"]:
-                try:
-                    item = await upload_queue.get()
-                except asyncio.CancelledError:
-                    break
-                if item is None:
-                    upload_queue.task_done()
-                    break
+        if ENABLE_STREAM_UPLOAD:
+            # Direct RAM-buffered streaming pipeline (zero disk usage for media files)
+            stream_sem = asyncio.Semaphore(2)
+            async def bounded_stream(vid):
+                async with stream_sem:
+                    await stream_pipeline_worker(vid)
 
-                vid, filepath = item
+            await asyncio.gather(*[bounded_stream(v) for v in videos])
+        else:
+            # Traditional disk-buffered pipeline
+            upload_queue = asyncio.Queue(maxsize=3)
+
+            async def download_worker(vid):
                 pos = await BAR_MANAGER.get_pos()
+                vid_name = vid.get('name') or vid.get('title') or "video"
+                state["active_downloads"][vid_name] = "<code>[Connecting...] ⏳</code>"
+
+                last_dl_pbar_time = [0.0]
+                async def dl_progress_callback(current, total):
+                    if time.time() - last_dl_pbar_time[0] >= 2.0:
+                        state["active_downloads"][vid_name] = get_progress_bar(current, total)
+                        last_dl_pbar_time[0] = time.time()
+
                 try:
-                    file_size = filepath.stat().st_size
-                    state["active_uploads"][vid['name']] = "<code>[Processing Metadata...] ⚙️</code>"
-
-                    last_pbar_time = [0.0]
-                    async def progress_callback(current, total):
-                        if time.time() - last_pbar_time[0] > 3:
-                            state["active_uploads"][vid['name']] = get_progress_bar(current, total)
-                            last_pbar_time[0] = time.time()
-
-                    metadata = get_video_metadata(filepath)
-                    thumb_path = filepath.with_suffix('.jpg')
-                    has_thumb = await generate_thumbnail(filepath, thumb_path)
-                    attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
-
-                    # Prepare rich caption & metadata (via Mistral AI)
-                    ai_meta = await generate_ai_caption(vid, service, cur_user_id)
-                    rich_caption = ai_meta["rich_caption"]
-                    db_title = ai_meta["db_title"]
-
-                    sent_msg = None
-                    for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
-                        try:
-                            with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [UP] {vid['name'][:20]}", position=pos, leave=False) as t_pbar:
-                                async def upload_progress(current, total):
-                                    await progress_callback(current, total)
-                                    t_pbar.n = current
-                                    t_pbar.refresh()
-                                with open(filepath, "rb") as f:
-                                    uploaded_file = await upload_file(client, f, progress_callback=upload_progress)
-                                sent_msg = await client.send_file(
-                                    target_channel_id,
-                                    uploaded_file,
-                                    caption=rich_caption,
-                                    parse_mode='html',
-                                    supports_streaming=True,
-                                    attributes=attributes,
-                                    thumb=str(thumb_path) if has_thumb else None,
-                                    video=True
-                                )
-                            break
-                        except Exception as e:
-                            if attempt == MAX_UPLOAD_RETRIES:
-                                raise e
-                            logger.warning(f"Upload attempt {attempt} failed for {vid['name']}: {e}. Retrying in {RETRY_DELAY}s...")
-                            await asyncio.sleep(RETRY_DELAY)
-
-                    # Automated indexing into Supabase if configured
-                    if sent_msg and supabase_client:
-                        try:
-                            db_entry = {
-                                "id": str(uuid.uuid4()),
-                                "title": db_title[:150],
-                                "file_id": "mtproto_uploaded",
-                                "message_id": sent_msg.id,
-                                "file_size": file_size,
-                                "upload_date": datetime.now(timezone.utc).isoformat()
-                            }
-                            await asyncio.to_thread(supabase_client.table("media").insert(db_entry).execute)
-                            logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {sent_msg.id})")
-                        except Exception as db_err:
-                            logger.warning(f"Supabase auto-index error: {db_err}")
-
-                    state["uploaded"] += 1
-                except Exception as e:
-                    logger.error(f"Error uploading {vid['name']}: {e}")
-                    state["failed"] += 1
+                    download_res = await download_video(
+                        domain, vid, temp_dir, pos=pos, progress_callback=dl_progress_callback
+                    )
+                    if download_res in ["skipped_size", "skipped_small", "error_html"]:
+                        state["skipped"] += 1
+                        return
+                    filepath = temp_dir / f"{vid['id']}_{vid['name']}"
+                    if download_res and filepath.exists():
+                        state["downloaded"] += 1
+                        await upload_queue.put((vid, filepath))
+                    else:
+                        state["failed"] += 1
                 finally:
-                    state["active_uploads"].pop(vid['name'], None)
-                    if has_thumb and thumb_path.exists():
-                        try: os.remove(thumb_path)
-                        except: pass
-                    if filepath.exists():
-                        try: os.remove(filepath)
-                        except: pass
+                    state["active_downloads"].pop(vid_name, None)
                     await BAR_MANAGER.release_pos(pos)
-                    upload_queue.task_done()
 
-        # Start dedicated sequential upload worker for maximum stability and speed
-        upload_tasks = [asyncio.create_task(upload_worker()) for _ in range(1)]
+            async def upload_worker():
+                while state["running"]:
+                    try:
+                        item = await upload_queue.get()
+                    except asyncio.CancelledError:
+                        break
+                    if item is None:
+                        upload_queue.task_done()
+                        break
 
-        # Run downloads with concurrency 3
-        dl_sem = asyncio.Semaphore(3)
-        async def bounded_download(vid):
-            async with dl_sem:
-                await download_worker(vid)
+                    vid, filepath = item
+                    pos = await BAR_MANAGER.get_pos()
+                    try:
+                        file_size = filepath.stat().st_size
+                        state["active_uploads"][vid['name']] = "<code>[Processing Metadata...] ⚙️</code>"
 
-        await asyncio.gather(*[bounded_download(v) for v in videos])
+                        last_pbar_time = [0.0]
+                        async def progress_callback(current, total):
+                            if time.time() - last_pbar_time[0] > 3:
+                                state["active_uploads"][vid['name']] = get_progress_bar(current, total)
+                                last_pbar_time[0] = time.time()
 
-        # Signal upload workers to finish
-        for _ in range(2):
-            await upload_queue.put(None)
-        await asyncio.gather(*upload_tasks)
+                        metadata = get_video_metadata(filepath)
+                        thumb_path = filepath.with_suffix('.jpg')
+                        has_thumb = await generate_thumbnail(filepath, thumb_path)
+                        attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
+
+                        ai_meta = await generate_ai_caption(vid, service, cur_user_id)
+                        rich_caption = ai_meta["rich_caption"]
+                        db_title = ai_meta["db_title"]
+
+                        sent_msg = None
+                        for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                            try:
+                                with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [UP] {vid['name'][:20]}", position=pos, leave=False) as t_pbar:
+                                    async def upload_progress(current, total):
+                                        await progress_callback(current, total)
+                                        t_pbar.n = current
+                                        t_pbar.refresh()
+                                    with open(filepath, "rb") as f:
+                                        uploaded_file = await upload_file(client, f, progress_callback=upload_progress)
+                                    sent_msg = await client.send_file(
+                                        target_channel_id,
+                                        uploaded_file,
+                                        caption=rich_caption,
+                                        parse_mode='html',
+                                        supports_streaming=True,
+                                        attributes=attributes,
+                                        thumb=str(thumb_path) if has_thumb else None,
+                                        video=True
+                                    )
+                                break
+                            except Exception as e:
+                                if attempt == MAX_UPLOAD_RETRIES:
+                                    raise e
+                                logger.warning(f"Upload attempt {attempt} failed for {vid['name']}: {e}. Retrying in {RETRY_DELAY}s...")
+                                await asyncio.sleep(RETRY_DELAY)
+
+                        if sent_msg and supabase_client:
+                            try:
+                                db_entry = {
+                                    "id": str(uuid.uuid4()),
+                                    "title": db_title[:150],
+                                    "file_id": "mtproto_uploaded",
+                                    "message_id": sent_msg.id,
+                                    "file_size": file_size,
+                                    "upload_date": datetime.now(timezone.utc).isoformat()
+                                }
+                                await asyncio.to_thread(supabase_client.table("media").insert(db_entry).execute)
+                                logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {sent_msg.id})")
+                            except Exception as db_err:
+                                logger.warning(f"Supabase auto-index error: {db_err}")
+
+                        state["uploaded"] += 1
+                    except Exception as e:
+                        logger.error(f"Error uploading {vid['name']}: {e}")
+                        state["failed"] += 1
+                    finally:
+                        state["active_uploads"].pop(vid['name'], None)
+                        if has_thumb and thumb_path.exists():
+                            try: os.remove(thumb_path)
+                            except: pass
+                        if filepath.exists():
+                            try: os.remove(filepath)
+                            except: pass
+                        await BAR_MANAGER.release_pos(pos)
+                        upload_queue.task_done()
+
+            upload_tasks = [asyncio.create_task(upload_worker()) for _ in range(1)]
+            dl_sem = asyncio.Semaphore(3)
+            async def bounded_download(vid):
+                async with dl_sem:
+                    await download_worker(vid)
+
+            await asyncio.gather(*[bounded_download(v) for v in videos])
+
+            for _ in range(2):
+                await upload_queue.put(None)
+            await asyncio.gather(*upload_tasks)
 
         state["running"] = False
         if status_task:

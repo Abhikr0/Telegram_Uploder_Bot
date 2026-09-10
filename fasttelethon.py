@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections import defaultdict
-from typing import Optional, List, AsyncGenerator, Union, Awaitable, DefaultDict, Tuple, BinaryIO
+from typing import Optional, List, AsyncGenerator, AsyncIterable, Union, Awaitable, DefaultDict, Tuple, BinaryIO
 
 from telethon import utils, helpers, TelegramClient
 from telethon.crypto import AuthKey
@@ -315,3 +315,97 @@ async def upload_file(client: TelegramClient,
                       ) -> TypeInputFile:
     res = (await _internal_transfer_to_telegram(client, file, progress_callback))[0]
     return res
+
+
+async def upload_stream(client: TelegramClient,
+                        stream: AsyncIterable[bytes],
+                        file_size: int,
+                        file_name: str,
+                        progress_callback: callable = None) -> Tuple[TypeInputFile, int]:
+    """
+    Upload an async stream of bytes directly to Telegram via ParallelTransferrer.
+    Zero disk usage!
+    """
+    file_id = helpers.generate_random_long()
+    hash_md5 = hashlib.md5()
+    uploader = ParallelTransferrer(client)
+    part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
+
+    pos = 0
+    buffer = bytearray()
+    async for chunk in stream:
+        if not chunk:
+            continue
+        buffer.extend(chunk)
+        while len(buffer) >= part_size:
+            part = bytes(buffer[:part_size])
+            del buffer[:part_size]
+            if not is_large:
+                hash_md5.update(part)
+            await uploader.upload(part)
+            pos += len(part)
+            if progress_callback:
+                r = progress_callback(pos, file_size)
+                if inspect.isawaitable(r):
+                    await r
+
+    if buffer:
+        part = bytes(buffer)
+        buffer.clear()
+        if not is_large:
+            hash_md5.update(part)
+        await uploader.upload(part)
+        pos += len(part)
+        if progress_callback:
+            r = progress_callback(pos, file_size)
+            if inspect.isawaitable(r):
+                await r
+
+    await uploader.finish_upload()
+    if is_large:
+        return InputFileBig(file_id, part_count, file_name), file_size
+    else:
+        return InputFile(file_id, part_count, file_name, hash_md5.hexdigest()), file_size
+
+
+async def upload_http_stream(client: TelegramClient,
+                             url: str,
+                             file_name: str,
+                             headers: Optional[dict] = None,
+                             progress_callback: callable = None,
+                             timeout: float = 60.0) -> Tuple[TypeInputFile, int]:
+    """
+    Streams directly from an HTTP(S) URL into Telegram MTProto parts with RAM buffering.
+    Zero disk usage!
+    """
+    import httpx
+    t = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=30.0)
+    async with httpx.AsyncClient(headers=headers, timeout=t, follow_redirects=True) as http:
+        async with http.stream("GET", url) as resp:
+            resp.raise_for_status()
+
+            file_size = 0
+            if "Content-Length" in resp.headers:
+                try:
+                    file_size = int(resp.headers["Content-Length"])
+                except ValueError:
+                    file_size = 0
+            if not file_size and "Content-Range" in resp.headers:
+                content_range = resp.headers["Content-Range"]
+                if "/" in content_range:
+                    try:
+                        file_size = int(content_range.split("/")[-1])
+                    except ValueError:
+                        file_size = 0
+
+            if not file_size or file_size <= 0:
+                raise ValueError(f"HTTP server for {file_name} did not supply Content-Length. Cannot determine total MTProto parts for streaming.")
+
+            return await upload_stream(
+                client=client,
+                stream=resp.aiter_bytes(),
+                file_size=file_size,
+                file_name=file_name,
+                progress_callback=progress_callback
+            )
+
