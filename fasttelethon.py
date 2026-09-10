@@ -62,8 +62,10 @@ class DownloadSender:
 class UploadSender:
     client: TelegramClient
     sender: MTProtoSender
-    request: Union[SaveFilePartRequest, SaveBigFilePartRequest]
+    file_id: int
     part_count: int
+    is_big: bool
+    current_part: int
     stride: int
     previous: Optional[asyncio.Task]
     loop: asyncio.AbstractEventLoop
@@ -73,11 +75,10 @@ class UploadSender:
                  stride: int, loop: asyncio.AbstractEventLoop) -> None:
         self.client = client
         self.sender = sender
+        self.file_id = file_id
         self.part_count = part_count
-        if big:
-            self.request = SaveBigFilePartRequest(file_id, index, part_count, b"")
-        else:
-            self.request = SaveFilePartRequest(file_id, index, b"")
+        self.is_big = big
+        self.current_part = index
         self.stride = stride
         self.previous = None
         self.loop = loop
@@ -85,14 +86,16 @@ class UploadSender:
     async def next(self, data: bytes) -> None:
         if self.previous:
             await self.previous
-        self.previous = self.loop.create_task(self._next(data))
+        part_idx = self.current_part
+        self.current_part += self.stride
+        self.previous = self.loop.create_task(self._next(part_idx, data))
 
-    async def _next(self, data: bytes) -> None:
-        self.request.bytes = data
-        log.debug(f"Sending file part {self.request.file_part}/{self.part_count}"
-                  f" with {len(data)} bytes")
-        await self.client._call(self.sender, self.request)
-        self.request.file_part += self.stride
+    async def _next(self, part_idx: int, data: bytes) -> None:
+        if self.is_big:
+            request = SaveBigFilePartRequest(self.file_id, part_idx, self.part_count, data)
+        else:
+            request = SaveFilePartRequest(self.file_id, part_idx, data)
+        await self.client._call(self.sender, request)
 
     async def disconnect(self) -> None:
         if self.previous:
@@ -118,15 +121,16 @@ class ParallelTransferrer:
         self.upload_ticker = 0
 
     async def _cleanup(self) -> None:
-        await asyncio.gather(*[sender.disconnect() for sender in self.senders])
-        self.senders = None
+        if self.senders:
+            await asyncio.gather(*[sender.disconnect() for sender in self.senders if sender], return_exceptions=True)
+            self.senders = None
 
     @staticmethod
-    def _get_connection_count(file_size: int, max_count: int = 8,
+    def _get_connection_count(file_size: int, max_count: int = 4,
                               full_size: int = 100 * 1024 * 1024) -> int:
         if file_size > full_size:
             return max_count
-        return math.ceil((file_size / full_size) * max_count)
+        return min(max_count, max(1, math.ceil((file_size / full_size) * max_count)))
 
     async def _init_download(self, connections: int, file: TypeLocation, part_count: int,
                              part_size: int) -> None:
@@ -189,9 +193,15 @@ class ParallelTransferrer:
     async def init_upload(self, file_id: int, file_size: int, part_size_kb: Optional[float] = None,
                           connection_count: Optional[int] = None) -> Tuple[int, int, bool]:
         connection_count = connection_count or self._get_connection_count(file_size)
-        part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
-        part_count = (file_size + part_size - 1) // part_size
         is_large = file_size > 10 * 1024 * 1024
+        if part_size_kb:
+            part_size = int(part_size_kb * 1024)
+        elif is_large:
+            # For files > 10MB, use maximum supported 512KB parts to halve round-trips
+            part_size = 512 * 1024
+        else:
+            part_size = utils.get_appropriated_part_size(file_size) * 1024
+        part_count = (file_size + part_size - 1) // part_size
         await self._init_upload(connection_count, file_id, part_count, is_large)
         return part_size, part_count, is_large
 
@@ -232,7 +242,7 @@ class ParallelTransferrer:
 parallel_transfer_locks: DefaultDict[int, asyncio.Lock] = defaultdict(lambda: asyncio.Lock())
 
 
-def stream_file(file_to_stream: BinaryIO, chunk_size=128 * 1024):
+def stream_file(file_to_stream: BinaryIO, chunk_size=512 * 1024):
     while True:
         data_read = file_to_stream.read(chunk_size)
         if not data_read:
@@ -250,28 +260,26 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
     hash_md5 = hashlib.md5()
     uploader = ParallelTransferrer(client)
     part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
-    buffer = bytearray()
-    for data in stream_file(response):
-        if progress_callback:
-            r = progress_callback(response.tell(), file_size)
-            if inspect.isawaitable(r):
-                await r
+
+    try:
+        response.seek(0)
+    except Exception:
+        pass
+
+    pos = 0
+    while True:
+        data = response.read(part_size)
+        if not data:
+            break
         if not is_large:
             hash_md5.update(data)
-        if len(buffer) == 0 and len(data) == part_size:
-            await uploader.upload(data)
-            continue
-        new_len = len(buffer) + len(data)
-        if new_len >= part_size:
-            cutoff = part_size - len(buffer)
-            buffer.extend(data[:cutoff])
-            await uploader.upload(bytes(buffer))
-            buffer.clear()
-            buffer.extend(data[cutoff:])
-        else:
-            buffer.extend(data)
-    if len(buffer) > 0:
-        await uploader.upload(bytes(buffer))
+        await uploader.upload(data)
+        pos += len(data)
+        if progress_callback:
+            r = progress_callback(pos, file_size)
+            if inspect.isawaitable(r):
+                await r
+
     await uploader.finish_upload()
     file_name = os.path.basename(response.name)
     if is_large:
