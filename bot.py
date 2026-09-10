@@ -11,8 +11,17 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, functions, types, errors
 from telethon.tl.types import DocumentAttributeVideo, BotCommand, BotCommandScopeDefault
 from tqdm import tqdm
+
+import subprocess
+import re
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
+import hachoir.core.config
+
+# Silence noisy hachoir parser warnings (e.g. non-standard MP4 atoms)
+hachoir.core.config.quiet = True
+
+
 
 # Fix Windows console UTF-8 emoji printing
 if sys.platform == "win32":
@@ -133,25 +142,61 @@ def get_progress_bar(current, total):
     remain = 10 - done
     return f"<code>[{'🟦' * done}{'⬜' * remain}] {percentage:.1%} ({format_bytes(current)} / {format_bytes(total)})</code>"
 
+def _extract_ffmpeg_metadata(filepath):
+    """Extract duration, width, and height using ffmpeg (robust against non-standard MP4 atoms)."""
+    meta = {'duration': 0, 'width': 0, 'height': 0}
+    try:
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+        res = subprocess.run(
+            [ffmpeg_cmd, "-hide_banner", "-i", str(filepath)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+            errors="replace"
+        )
+        output = (res.stderr or "") + " " + (res.stdout or "")
+        dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
+        if dur_match:
+            h, m, s = dur_match.groups()
+            meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
+        vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
+        if vid_match:
+            meta['width'] = int(vid_match.group(1))
+            meta['height'] = int(vid_match.group(2))
+    except Exception as e:
+        logger.debug(f"ffmpeg metadata extraction failed for {filepath}: {e}")
+    return meta
+
 def get_video_metadata(filepath):
-    """Extract duration, width, and height from video file."""
-    metadata = {'duration': 0, 'width': 0, 'height': 0}
+    """Extract duration, width, and height from video file with ffmpeg and hachoir fallback."""
+    # Attempt ffmpeg first (most reliable on modern MP4/WebM/MKV atoms without parser crashes)
+    metadata = _extract_ffmpeg_metadata(filepath)
+    if metadata['duration'] > 0 and metadata['width'] > 0:
+        return metadata
+
+    # Fallback to hachoir if ffmpeg is unavailable or returned incomplete metadata
     try:
         parser = createParser(str(filepath))
-        if not parser:
-            return metadata
-        with parser:
-            data = extractMetadata(parser)
-            if data:
-                if data.has('duration'):
-                    metadata['duration'] = int(data.get('duration').seconds)
-                if data.has('width'):
-                    metadata['width'] = int(data.get('width'))
-                if data.has('height'):
-                    metadata['height'] = int(data.get('height'))
+        if parser:
+            with parser:
+                data = extractMetadata(parser)
+                if data:
+                    if not metadata['duration'] and data.has('duration'):
+                        metadata['duration'] = int(data.get('duration').seconds)
+                    if not metadata['width'] and data.has('width'):
+                        metadata['width'] = int(data.get('width'))
+                    if not metadata['height'] and data.has('height'):
+                        metadata['height'] = int(data.get('height'))
     except Exception as e:
-        logger.warning(f"Metadata extraction failed for {filepath}: {e}")
+        logger.debug(f"Hachoir fallback failed for {filepath}: {e}")
     return metadata
+
 
 async def generate_thumbnail(filepath, thumb_path):
     """Generate a thumbnail for the video using ffmpeg."""
