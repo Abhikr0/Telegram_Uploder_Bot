@@ -21,12 +21,6 @@ import hachoir.core.config
 # Silence noisy hachoir parser warnings (e.g. non-standard MP4 atoms)
 hachoir.core.config.quiet = True
 
-try:
-    from PIL import Image
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-
 
 
 # Fix Windows console UTF-8 emoji printing
@@ -158,60 +152,16 @@ def get_progress_bar(current, total):
     remain = 10 - done
     return f"<code>[{'🟦' * done}{'⬜' * remain}] {percentage:.1%} ({format_bytes(current)} / {format_bytes(total)})</code>"
 
-def get_ffmpeg_binary() -> str:
-    """Finds a working ffmpeg binary from system PATH or imageio_ffmpeg, ensuring executable permissions."""
-    system_ffmpeg = shutil.which("ffmpeg")
-    if system_ffmpeg:
-        return system_ffmpeg
-    try:
-        import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe and os.path.exists(exe):
-            if sys.platform != "win32":
-                try:
-                    os.chmod(exe, 0o755)
-                except Exception:
-                    pass
-            return exe
-    except Exception:
-        pass
-    return "ffmpeg"
-
-
-def validate_and_optimize_thumbnail(thumb_path: Path) -> tuple[bool, int, int]:
-    """
-    Validates thumbnail existence, dynamically resizes to <= 320x320 preserving exact aspect ratio,
-    converts to standard RGB JPEG, and returns (is_valid, width, height).
-    Telegram MTProto strictly drops/rejects thumbnails whose width or height exceeds 320px.
-    """
-    if not thumb_path or not thumb_path.exists() or thumb_path.stat().st_size < 100:
-        return False, 0, 0
-
-    if HAS_PIL:
-        try:
-            with Image.open(thumb_path) as im:
-                w, h = im.size
-                if w <= 0 or h <= 0:
-                    return False, 0, 0
-                # Scale down proportionally if larger than 320x320
-                if w > 320 or h > 320:
-                    im.thumbnail((320, 320), Image.Resampling.LANCZOS)
-                rgb_im = im.convert("RGB")
-                rgb_im.save(str(thumb_path), format="JPEG", quality=85, optimize=True)
-                final_w, final_h = rgb_im.size
-                return True, final_w, final_h
-        except Exception as e:
-            logger.warning(f"PIL thumbnail optimization failed for {thumb_path}: {e}")
-
-    # Fallback if PIL is unavailable or errors
-    return thumb_path.exists() and thumb_path.stat().st_size > 500, 0, 0
-
-
 def _extract_ffmpeg_metadata(filepath):
-    """Extract duration, width, height, and display rotation dynamically using ffmpeg."""
+    """Extract duration, width, and height using ffmpeg (robust against non-standard MP4 atoms)."""
     meta = {'duration': 0, 'width': 0, 'height': 0}
     try:
-        ffmpeg_cmd = get_ffmpeg_binary()
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
         res = subprocess.run(
             [ffmpeg_cmd, "-hide_banner", "-i", str(filepath)],
             stdout=subprocess.PIPE,
@@ -224,20 +174,13 @@ def _extract_ffmpeg_metadata(filepath):
         dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
         if dur_match:
             h, m, s = dur_match.groups()
-            meta['duration'] = int(int(h) * 3600 + int(m) * 60 + round(float(s)))
+            meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
         vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
         if vid_match:
-            w = int(vid_match.group(1))
-            h = int(vid_match.group(2))
-            rot_match = re.search(r'rotate\s*:\s*(\d+)', output, re.IGNORECASE) or re.search(r'rotation of (-?\d+)', output, re.IGNORECASE)
-            if rot_match:
-                rot = abs(int(float(rot_match.group(1)))) % 360
-                if rot in (90, 270):
-                    w, h = h, w
-            meta['width'] = w
-            meta['height'] = h
+            meta['width'] = int(vid_match.group(1))
+            meta['height'] = int(vid_match.group(2))
     except Exception as e:
-        logger.warning(f"ffmpeg metadata extraction failed for {filepath}: {e}")
+        logger.debug(f"ffmpeg metadata extraction failed for {filepath}: {e}")
     return meta
 
 def get_video_metadata(filepath):
@@ -266,27 +209,23 @@ def get_video_metadata(filepath):
 
 
 async def generate_thumbnail(filepath, thumb_path):
-    """Generate a thumbnail for the video using ffmpeg scaled dynamically preserving aspect ratio (max 320x320)."""
+    """Generate a thumbnail for the video using ffmpeg."""
     try:
-        ffmpeg_cmd = get_ffmpeg_binary()
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
         process = await asyncio.create_subprocess_exec(
-            ffmpeg_cmd, '-y',
-            '-ss', '00:00:00.500',
-            '-i', str(filepath),
-            '-vf', 'scale=320:320:force_original_aspect_ratio=decrease,format=yuv420p',
-            '-frames:v', '1',
-            '-update', '1',
-            '-q:v', '2',
+            ffmpeg_cmd, '-y', '-i', str(filepath),
+            '-ss', '00:00:01.000', '-vframes', '1',
             str(thumb_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await asyncio.wait_for(process.communicate(), timeout=10.0)
-        is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-        if is_valid:
-            logger.info(f"Local thumbnail generated ({tw}x{th}): {thumb_path.stat().st_size} bytes")
-            return True
-        return False
+        await process.communicate()
+        return thumb_path.exists()
     except Exception as e:
         logger.warning(f"Thumbnail generation failed for {filepath}: {e}")
         return False
@@ -294,141 +233,60 @@ async def generate_thumbnail(filepath, thumb_path):
 
 async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_path: Path) -> tuple[dict, bool]:
     """
-    Extracts video metadata (duration, width, height) dynamically and generates a thumbnail
-    using direct FFmpeg Range probing with fallback to snippet probe.
+    Extracts video metadata (duration, width, height) and generates a thumbnail
+    directly from an HTTP URL using imageio_ffmpeg in 1-2 seconds without downloading the whole file.
     """
     meta = {'duration': 0, 'width': 0, 'height': 0}
     has_thumb = False
-    ffmpeg_cmd = get_ffmpeg_binary()
-
-    # Prepare sanitized headers for FFmpeg
-    clean_headers = {}
-    if headers:
-        for k, v in headers.items():
-            if k.lower() not in ("connection", "accept-encoding", "range"):
-                clean_headers[k] = v
-    headers_str = "".join(f"{k}: {v}\r\n" for k, v in clean_headers.items()) if clean_headers else ""
-
-    # Strategy 1: Direct FFmpeg stream probe with seekable HTTP range
     try:
-        hdr_args = ["-headers", headers_str] if headers_str else []
-        cmd = [
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+
+        hdr_args = []
+        if headers:
+            headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            hdr_args = ["-headers", headers_str]
+
+        thumb_cmd = [
             ffmpeg_cmd, "-y",
             *hdr_args,
-            "-seekable", "1",
-            "-ss", "00:00:00.500",
+            "-ss", "00:00:01.000",
             "-i", url,
-            "-vf", "scale=320:320:force_original_aspect_ratio=decrease,format=yuv420p",
-            "-frames:v", "1",
-            "-update", "1",
+            "-vframes", "1",
             "-q:v", "2",
             str(thumb_path)
         ]
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *thumb_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8.0)
-        output = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
-
-        dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
-        if dur_match:
-            h, m, s = dur_match.groups()
-            meta['duration'] = int(int(h) * 3600 + int(m) * 60 + round(float(s)))
-        vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
-        if vid_match:
-            w = int(vid_match.group(1))
-            h = int(vid_match.group(2))
-            rot_match = re.search(r'rotate\s*:\s*(\d+)', output, re.IGNORECASE) or re.search(r'rotation of (-?\d+)', output, re.IGNORECASE)
-            if rot_match:
-                rot = abs(int(float(rot_match.group(1)))) % 360
-                if rot in (90, 270):
-                    w, h = h, w
-            meta['width'] = w
-            meta['height'] = h
-
-        is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-        if is_valid:
-            has_thumb = True
-            logger.info(f"Direct stream thumbnail generated ({tw}x{th}): {thumb_path.stat().st_size} bytes")
-    except Exception as e:
-        logger.debug(f"Direct stream probe attempt: {e}")
-
-    # Strategy 2: If thumbnail or metadata incomplete, fallback to 2MB snippet probe
-    if not has_thumb or meta['duration'] == 0 or meta['width'] == 0:
-        probe_path = thumb_path.with_suffix(".probe.mp4")
         try:
-            req_headers = headers.copy() if headers else {}
-            req_headers["Range"] = "bytes=0-2097152"
-            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as h_client:
-                resp = await h_client.get(url, headers=req_headers)
-                if resp.status_code in (200, 206) and len(resp.content) > 10000:
-                    probe_path.write_bytes(resp.content)
-
-            if probe_path.exists():
-                cmd2 = [
-                    ffmpeg_cmd, "-y",
-                    "-ss", "00:00:00.200",
-                    "-i", str(probe_path),
-                    "-vf", "scale=320:320:force_original_aspect_ratio=decrease,format=yuv420p",
-                    "-frames:v", "1",
-                    "-update", "1",
-                    "-q:v", "2",
-                    str(thumb_path)
-                ]
-                proc2 = await asyncio.create_subprocess_exec(
-                    *cmd2,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=8.0)
-                output2 = (stderr2.decode(errors="replace") or "") + " " + (stdout2.decode(errors="replace") or "")
-
-                if meta['duration'] == 0:
-                    dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output2)
-                    if dur_match:
-                        h, m, s = dur_match.groups()
-                        meta['duration'] = int(int(h) * 3600 + int(m) * 60 + round(float(s)))
-                if meta['width'] == 0:
-                    vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output2)
-                    if vid_match:
-                        w = int(vid_match.group(1))
-                        h = int(vid_match.group(2))
-                        rot_match = re.search(r'rotate\s*:\s*(\d+)', output2, re.IGNORECASE) or re.search(r'rotation of (-?\d+)', output2, re.IGNORECASE)
-                        if rot_match:
-                            rot = abs(int(float(rot_match.group(1)))) % 360
-                            if rot in (90, 270):
-                                w, h = h, w
-                        meta['width'] = w
-                        meta['height'] = h
-
-                if not has_thumb:
-                    is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-                    if is_valid:
-                        has_thumb = True
-                        logger.info(f"Snippet probe thumbnail generated ({tw}x{th})")
-        except Exception as e:
-            logger.debug(f"Snippet probe fallback error: {e}")
-        finally:
-            if probe_path.exists():
-                try: probe_path.unlink()
-                except Exception: pass
-
-    # If thumbnail exists, reconcile dimensions with thumbnail aspect ratio
-    if has_thumb and thumb_path.exists():
-        is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-        if is_valid and tw > 0 and th > 0:
-            if meta['width'] == 0 or meta['height'] == 0:
-                meta['width'] = tw
-                meta['height'] = th
-            elif (th > tw) and (meta['width'] > meta['height']):
-                meta['width'], meta['height'] = meta['height'], meta['width']
-            elif (tw > th) and (meta['height'] > meta['width']):
-                meta['width'], meta['height'] = meta['height'], meta['width']
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+            output = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
+            dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
+            if dur_match:
+                h, m, s = dur_match.groups()
+                meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
+            vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
+            if vid_match:
+                meta['width'] = int(vid_match.group(1))
+                meta['height'] = int(vid_match.group(2))
+            has_thumb = thumb_path.exists()
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            logger.debug(f"ffmpeg stream probing timed out for {url[:50]}")
+    except Exception as e:
+        logger.debug(f"Stream thumbnail/metadata extraction failed: {e}")
 
     return meta, has_thumb
-
 
 
 def render_album_browser(user_id: int):
@@ -655,32 +513,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 metadata = get_video_metadata(filepath)
                 thumb_path = filepath.with_suffix('.jpg')
                 has_thumb = await generate_thumbnail(filepath, thumb_path)
-
-                vid_duration = int(metadata.get('duration', 0) or 0)
-                vid_width = int(metadata.get('width', 0) or 0)
-                vid_height = int(metadata.get('height', 0) or 0)
-
-                # Reconcile or derive dimensions dynamically from thumbnail if missing or rotated
-                if has_thumb and thumb_path and thumb_path.exists():
-                    is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-                    if is_valid and tw > 0 and th > 0:
-                        if vid_width == 0 or vid_height == 0:
-                            vid_width, vid_height = tw, th
-                        elif (th > tw) and (vid_width > vid_height):
-                            vid_width, vid_height = vid_height, vid_width
-                        elif (tw > th) and (vid_height > vid_width):
-                            vid_width, vid_height = vid_height, vid_width
-
-                # Fallback to standard 16:9 only if all dynamic detection failed
-                if vid_width == 0 or vid_height == 0:
-                    vid_width, vid_height = 1280, 720
-
-                attributes = [DocumentAttributeVideo(
-                    duration=vid_duration,
-                    w=vid_width,
-                    h=vid_height,
-                    supports_streaming=True
-                )]
+                attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
 
                 # Prepare rich caption & metadata (via Mistral AI)
                 ai_meta = await generate_ai_caption(vid, service, cur_user_id)
@@ -704,8 +537,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 parse_mode='html',
                                 supports_streaming=True,
                                 attributes=attributes,
-                                thumb=str(thumb_path) if has_thumb and thumb_path and thumb_path.exists() else None,
-                                mime_type="video/mp4"
+                                thumb=str(thumb_path) if has_thumb else None,
+                                video=True
                             )
                         break
                     except Exception as e:
@@ -775,8 +608,6 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 stream_headers = info["headers"]
                 file_size = info["file_size"]
                 stream_filename = info.get("name") or f"{vid['id']}_{vid_name}"
-                if not Path(stream_filename).suffix.lower() in (".mp4", ".mkv", ".mov", ".webm", ".avi", ".ts"):
-                    stream_filename += ".mp4"
 
                 state["active_uploads"][vid_name] = "<code>[Probing Stream...] ⚙️</code>"
                 thumb_path = temp_dir / f"{vid['id']}_thumb.jpg"
@@ -788,30 +619,14 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                             t_resp = await thumb_client.get(vid["thumbnail"])
                             if t_resp.status_code == 200 and len(t_resp.content) > 1000:
                                 thumb_path.write_bytes(t_resp.content)
-                                is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-                                if is_valid:
-                                    has_thumb = True
-                                    if meta.get('width', 0) == 0 or meta.get('height', 0) == 0:
-                                        meta['width'], meta['height'] = tw, th
+                                has_thumb = True
                     except Exception:
                         pass
 
-                vid_duration = int(meta.get('duration', 0) or 0)
-                vid_width = int(meta.get('width', 0) or 0)
-                vid_height = int(meta.get('height', 0) or 0)
-
-                if (vid_width == 0 or vid_height == 0) and has_thumb and thumb_path and thumb_path.exists():
-                    is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-                    if is_valid and tw > 0 and th > 0:
-                        vid_width, vid_height = tw, th
-
-                if vid_width == 0 or vid_height == 0:
-                    vid_width, vid_height = 1280, 720
-
                 attributes = [DocumentAttributeVideo(
-                    duration=vid_duration,
-                    w=vid_width,
-                    h=vid_height,
+                    duration=meta.get('duration', 0),
+                    w=meta.get('width', 0),
+                    h=meta.get('height', 0),
                     supports_streaming=True
                 )]
 
@@ -844,8 +659,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 parse_mode='html',
                                 supports_streaming=True,
                                 attributes=attributes,
-                                thumb=str(thumb_path) if has_thumb and thumb_path and thumb_path.exists() else None,
-                                mime_type="video/mp4"
+                                thumb=str(thumb_path) if has_thumb else None,
+                                video=True
                             )
                         break
                     except Exception as e:
@@ -948,30 +763,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         metadata = get_video_metadata(filepath)
                         thumb_path = filepath.with_suffix('.jpg')
                         has_thumb = await generate_thumbnail(filepath, thumb_path)
-
-                        vid_duration = int(metadata.get('duration', 0) or 0)
-                        vid_width = int(metadata.get('width', 0) or 0)
-                        vid_height = int(metadata.get('height', 0) or 0)
-
-                        if has_thumb and thumb_path and thumb_path.exists():
-                            is_valid, tw, th = validate_and_optimize_thumbnail(thumb_path)
-                            if is_valid and tw > 0 and th > 0:
-                                if vid_width == 0 or vid_height == 0:
-                                    vid_width, vid_height = tw, th
-                                elif (th > tw) and (vid_width > vid_height):
-                                    vid_width, vid_height = vid_height, vid_width
-                                elif (tw > th) and (vid_height > vid_width):
-                                    vid_width, vid_height = vid_height, vid_width
-
-                        if vid_width == 0 or vid_height == 0:
-                            vid_width, vid_height = 1280, 720
-
-                        attributes = [DocumentAttributeVideo(
-                            duration=vid_duration,
-                            w=vid_width,
-                            h=vid_height,
-                            supports_streaming=True
-                        )]
+                        attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
 
                         ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                         rich_caption = ai_meta["rich_caption"]
@@ -994,8 +786,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                         parse_mode='html',
                                         supports_streaming=True,
                                         attributes=attributes,
-                                        thumb=str(thumb_path) if has_thumb and thumb_path and thumb_path.exists() else None,
-                                        mime_type="video/mp4"
+                                        thumb=str(thumb_path) if has_thumb else None,
+                                        video=True
                                     )
                                 break
                             except Exception as e:
@@ -1608,21 +1400,4 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    try:
-        client.loop.run_until_complete(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        try:
-            if client.is_connected():
-                client.loop.run_until_complete(client.disconnect())
-        except Exception:
-            pass
-        try:
-            pending = [t for t in asyncio.all_tasks(client.loop) if not t.done()]
-            for t in pending:
-                t.cancel()
-            if pending:
-                client.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        except Exception:
-            pass
+    client.loop.run_until_complete(main())
