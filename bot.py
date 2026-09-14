@@ -397,13 +397,25 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
     meta = {'duration': 0, 'width': 0, 'height': 0}
     has_thumb = False
     try:
-        hdr_args = []
+        # Always inject a browser-like User-Agent so CDNs (Bunkr, etc.) don't block ffmpeg.
+        # ffmpeg's default UA is "Lavf/xx.xx.xx" which many CDNs silently reject.
+        # Merge caller-supplied headers on top of defaults so they can override if needed.
+        effective_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": url.split("?")[0],   # base URL without token as referer
+        }
         if headers:
-            headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-            hdr_args = ["-headers", headers_str]
+            effective_headers.update(headers)  # caller headers win if they set UA
 
-        # 1. Probe stream for metadata
-        #    Use ffprobe JSON if available; fall back to ffmpeg stderr regex otherwise.
+        # ffmpeg/ffprobe -headers format: "Key: Value\r\n" per header, all in one string
+        headers_str = "".join(f"{k}: {v}\r\n" for k, v in effective_headers.items())
+        hdr_args = ["-headers", headers_str]
+
+        # ── 1. Probe stream for metadata ──────────────────────────────────────
         ffprobe = _get_ffprobe()  # None when only imageio_ffmpeg is installed
 
         if ffprobe:
@@ -412,11 +424,9 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                 "-print_format", "json",
                 "-show_streams",
                 "-show_format",
+                *hdr_args,
+                url
             ]
-            if hdr_args:
-                ffprobe_cmd += hdr_args
-            ffprobe_cmd.append(url)
-
             probe_proc = await asyncio.create_subprocess_exec(
                 *ffprobe_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -450,7 +460,7 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                 logger.warning(f"ffprobe stream probing timed out for {url[:80]}")
             except Exception as e:
                 logger.warning(f"ffprobe stream probe failed ({e}), trying ffmpeg stderr fallback")
-                ffprobe = None  # signal to run ffmpeg fallback below
+                ffprobe = None
 
         if not ffprobe or meta["duration"] == 0:
             # ffprobe unavailable OR returned no duration → use ffmpeg stderr parsing
@@ -459,7 +469,7 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                     _get_ffmpeg(), "-hide_banner", *hdr_args, "-i", url,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
-                _, fb_stderr = await asyncio.wait_for(fb_proc.communicate(), timeout=20.0)
+                _, fb_stderr = await asyncio.wait_for(fb_proc.communicate(), timeout=25.0)
                 output = fb_stderr.decode(errors="replace")
                 dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
                 if dur_match:
@@ -470,10 +480,13 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                     meta['width'] = int(vid_match.group(1))
                     meta['height'] = int(vid_match.group(2))
                 logger.info(f"ffmpeg stderr stream metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
+                if meta['duration'] == 0:
+                    # Log the raw ffmpeg output so we can debug further if still failing
+                    logger.warning(f"ffmpeg probe returned no duration. stderr tail: {output[-500:]}")
             except Exception as e2:
                 logger.warning(f"ffmpeg stream probe also failed: {e2}")
 
-        # 2. Extract middle frame thumbnail
+        # ── 2. Extract thumbnail ───────────────────────────────────────────────
         seek_time = "00:00:01.000"
         if meta['duration'] > 2:
             mid = meta['duration'] // 2
@@ -487,12 +500,15 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
         )
         thumb_cmd = [
             _get_ffmpeg(), "-hide_banner", "-y",
+            # INPUT seek for HTTP streams: ffmpeg uses HTTP byte-range requests to jump
+            # directly to the target time — this is fast and doesn't download from byte 0.
+            # (Output seek = -ss after -i = decodes from byte 0, which hangs on large streams)
+            "-ss", seek_time,
             *hdr_args,
-            "-i", url,           # -i FIRST
-            "-ss", seek_time,     # -ss AFTER -i = output seek (accurate on Linux)
+            "-i", url,
             "-vframes", "1",
             "-vf", stream_vf,
-            "-vcodec", "mjpeg",  # explicit JPEG encoder for Ubuntu compatibility
+            "-vcodec", "mjpeg",
             "-q:v", "3",
             str(thumb_path)
         ]
@@ -502,14 +518,14 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
             stderr=asyncio.subprocess.PIPE
         )
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=90.0)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
             has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
             if has_thumb:
                 size_kb = thumb_path.stat().st_size // 1024
                 logger.info(f"Stream thumbnail generated: {thumb_path.name} ({size_kb} KB), meta={meta}")
             else:
-                err_out = stderr.decode(errors="replace")[-1000:] if stderr else "(no output)"
-                logger.warning(f"Stream thumbnail NOT generated. ffmpeg output tail: {err_out}")
+                err_out = stderr.decode(errors="replace")[-1500:] if stderr else "(no output)"
+                logger.warning(f"Stream thumbnail NOT generated. ffmpeg stderr: {err_out}")
         except asyncio.TimeoutError:
             try: proc.kill()
             except Exception: pass
