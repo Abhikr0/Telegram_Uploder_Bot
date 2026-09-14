@@ -247,12 +247,17 @@ def get_video_metadata(filepath):
     return metadata
 
 
-async def generate_thumbnail(filepath, thumb_path):
+async def generate_thumbnail(filepath, thumb_path, duration=0):
     """Generate a thumbnail for the video using ffmpeg, scaled to <=320x320 JPEG."""
+    seek_time = "00:00:01.000"
+    if duration > 2:
+        mid = int(duration) // 2
+        seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
+        
     try:
         process = await asyncio.create_subprocess_exec(
-            _get_ffmpeg(), '-y',
-            '-ss', '00:00:01.000',
+            _get_ffmpeg(), '-hide_banner', '-y',
+            '-ss', seek_time,
             '-i', str(filepath),
             '-vframes', '1',
             '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
@@ -262,12 +267,12 @@ async def generate_thumbnail(filepath, thumb_path):
             stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await process.communicate()
-        exists = thumb_path.exists()
+        exists = thumb_path.exists() and thumb_path.stat().st_size > 0
         if exists:
             size_kb = thumb_path.stat().st_size // 1024
             logger.info(f"Thumbnail generated: {thumb_path.name} ({size_kb} KB)")
         else:
-            err_out = stderr.decode(errors='replace')[-300:] if stderr else '(no output)'
+            err_out = stderr.decode(errors='replace')[-1000:] if stderr else '(no output)'
             logger.warning(f"Thumbnail NOT generated for {filepath}. ffmpeg stderr: {err_out}")
         return exists
     except Exception as e:
@@ -288,10 +293,45 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             hdr_args = ["-headers", headers_str]
 
-        thumb_cmd = [
-            _get_ffmpeg(), "-y",
+        # 1. Probe stream for metadata
+        probe_cmd = [
+            _get_ffmpeg(), "-hide_banner",
             *hdr_args,
-            "-ss", "00:00:01.000",
+            "-i", url
+        ]
+        probe_proc = await asyncio.create_subprocess_exec(
+            *probe_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            _, stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=20.0)
+            output = stderr.decode(errors="replace")
+        except asyncio.TimeoutError:
+            try: probe_proc.kill()
+            except Exception: pass
+            output = ""
+            logger.warning(f"ffmpeg stream probing timed out for {url[:80]}")
+
+        dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
+        if dur_match:
+            h, m, s = dur_match.groups()
+            meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
+        vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
+        if vid_match:
+            meta['width'] = int(vid_match.group(1))
+            meta['height'] = int(vid_match.group(2))
+
+        # 2. Extract middle frame thumbnail
+        seek_time = "00:00:01.000"
+        if meta['duration'] > 2:
+            mid = meta['duration'] // 2
+            seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
+
+        thumb_cmd = [
+            _get_ffmpeg(), "-hide_banner", "-y",
+            *hdr_args,
+            "-ss", seek_time,
             "-i", url,
             "-vframes", "1",
             "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
@@ -304,28 +344,18 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
             stderr=asyncio.subprocess.PIPE
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            output = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
-            dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
-            if dur_match:
-                h, m, s = dur_match.groups()
-                meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
-            vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
-            if vid_match:
-                meta['width'] = int(vid_match.group(1))
-                meta['height'] = int(vid_match.group(2))
-            has_thumb = thumb_path.exists()
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=90.0)
+            has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
             if has_thumb:
                 size_kb = thumb_path.stat().st_size // 1024
                 logger.info(f"Stream thumbnail generated: {thumb_path.name} ({size_kb} KB), meta={meta}")
             else:
-                logger.warning(f"Stream thumbnail NOT generated. ffmpeg output tail: {output[-300:]}")
+                err_out = stderr.decode(errors="replace")[-1000:] if stderr else "(no output)"
+                logger.warning(f"Stream thumbnail NOT generated. ffmpeg output tail: {err_out}")
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            logger.warning(f"ffmpeg stream probing timed out for {url[:80]}")
+            try: proc.kill()
+            except Exception: pass
+            logger.warning(f"ffmpeg thumbnail extraction timed out for {url[:80]}")
     except Exception as e:
         logger.warning(f"Stream thumbnail/metadata extraction failed: {e}")
 
@@ -558,13 +588,16 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
                 metadata = get_video_metadata(filepath)
                 thumb_path = filepath.with_suffix('.jpg')
-                has_thumb = await generate_thumbnail(filepath, thumb_path)
+                has_thumb = await generate_thumbnail(filepath, thumb_path, duration=metadata.get('duration', 0))
                 attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
 
                 # Prepare rich caption & metadata (via Mistral AI)
                 ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                 rich_caption = ai_meta["rich_caption"]
                 db_title = ai_meta["db_title"]
+
+                # Let the user see if ffmpeg succeeded via the Telegram UI
+                state["active_uploads"][vid['name']] = f"<code>[T:{'✅' if has_thumb else '❌'} D:{metadata.get('duration', 0)}s] Uploading... 🚀</code>"
 
                 sent_msg = None
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
@@ -699,7 +732,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 rich_caption = ai_meta["rich_caption"]
                 db_title = ai_meta["db_title"]
 
-                state["active_uploads"][vid_name] = "<code>[Streaming to Telegram...] 🚀</code>"
+                # Let the user see if ffmpeg succeeded via the Telegram UI
+                state["active_uploads"][vid_name] = f"<code>[T:{'✅' if has_thumb else '❌'} D:{meta.get('duration', 0)}s] Streaming... 🚀</code>"
 
                 sent_msg = None
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
