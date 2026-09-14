@@ -391,147 +391,180 @@ async def generate_thumbnail(filepath, thumb_path, duration=0):
 
 async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_path: Path) -> tuple[dict, bool]:
     """
-    Extracts video metadata (duration, width, height) and generates a thumbnail
-    directly from an HTTP URL using imageio_ffmpeg in 1-2 seconds without downloading the whole file.
+    Extracts video metadata (duration, width, height) and generates a thumbnail from
+    an HTTP stream URL.
+
+    Strategy (in order):
+      1. ffprobe JSON on URL directly  — best quality, only if system ffprobe is available
+      2. ffmpeg stderr probe on URL    — fallback if only ffprobe is missing
+      3. Partial chunk download (4 MB) — last resort when imageio_ffmpeg has no HTTP protocol
+         support. httpx downloads the chunk; ffmpeg works on the local temp file.
     """
     meta = {'duration': 0, 'width': 0, 'height': 0}
     has_thumb = False
+
+    # Build browser-like headers for every ffmpeg/ffprobe HTTP request.
+    # imageio_ffmpeg's default UA ("Lavf/xx") is blocked by many CDNs silently.
+    effective_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": url.split("?")[0],
+    }
+    if headers:
+        effective_headers.update(headers)
+
+    # ffmpeg -headers arg: one "Key: Value\r\n" string for all headers
+    hdr_args = ["-headers", "".join(f"{k}: {v}\r\n" for k, v in effective_headers.items())]
+
+    partial_path: Path | None = None  # temp file used by fallback path
+
     try:
-        # Always inject a browser-like User-Agent so CDNs (Bunkr, etc.) don't block ffmpeg.
-        # ffmpeg's default UA is "Lavf/xx.xx.xx" which many CDNs silently reject.
-        # Merge caller-supplied headers on top of defaults so they can override if needed.
-        effective_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Referer": url.split("?")[0],   # base URL without token as referer
-        }
-        if headers:
-            effective_headers.update(headers)  # caller headers win if they set UA
-
-        # ffmpeg/ffprobe -headers format: "Key: Value\r\n" per header, all in one string
-        headers_str = "".join(f"{k}: {v}\r\n" for k, v in effective_headers.items())
-        hdr_args = ["-headers", headers_str]
-
-        # ── 1. Probe stream for metadata ──────────────────────────────────────
-        ffprobe = _get_ffprobe()  # None when only imageio_ffmpeg is installed
+        # ── Path A: URL-based probing (only works with system ffprobe/ffmpeg HTTP) ──
+        ffprobe = _get_ffprobe()
 
         if ffprobe:
-            ffprobe_cmd = [
-                ffprobe, "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                "-show_format",
-                *hdr_args,
-                url
-            ]
-            probe_proc = await asyncio.create_subprocess_exec(
-                *ffprobe_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
             try:
+                probe_proc = await asyncio.create_subprocess_exec(
+                    ffprobe, "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_streams", "-show_format",
+                    *hdr_args, url,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
                 probe_stdout, _ = await asyncio.wait_for(probe_proc.communicate(), timeout=25.0)
                 probe_data = json.loads(probe_stdout or b"{}")
 
                 fmt_dur = probe_data.get("format", {}).get("duration", "")
                 if fmt_dur and fmt_dur not in ("", "N/A"):
                     meta["duration"] = int(float(fmt_dur))
-
                 for stream in probe_data.get("streams", []):
                     if stream.get("codec_type") == "video":
-                        w = stream.get("width", 0)
-                        h = stream.get("height", 0)
+                        w, h = stream.get("width", 0), stream.get("height", 0)
                         if w and h:
-                            meta["width"] = int(w)
-                            meta["height"] = int(h)
+                            meta["width"], meta["height"] = int(w), int(h)
                         if not meta["duration"]:
                             s_dur = stream.get("duration", "")
                             if s_dur and s_dur not in ("", "N/A"):
                                 meta["duration"] = int(float(s_dur))
                         break
-
-                logger.info(f"ffprobe stream metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
+                logger.info(f"ffprobe URL metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
             except asyncio.TimeoutError:
-                try: probe_proc.kill()
-                except Exception: pass
-                logger.warning(f"ffprobe stream probing timed out for {url[:80]}")
+                logger.warning(f"ffprobe URL probe timed out for {url[:80]}")
             except Exception as e:
-                logger.warning(f"ffprobe stream probe failed ({e}), trying ffmpeg stderr fallback")
-                ffprobe = None
+                logger.warning(f"ffprobe URL probe failed: {e}")
 
+        # Try ffmpeg stderr probe on URL if ffprobe unavailable or gave no duration
         if not ffprobe or meta["duration"] == 0:
-            # ffprobe unavailable OR returned no duration → use ffmpeg stderr parsing
             try:
                 fb_proc = await asyncio.create_subprocess_exec(
                     _get_ffmpeg(), "-hide_banner", *hdr_args, "-i", url,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
-                _, fb_stderr = await asyncio.wait_for(fb_proc.communicate(), timeout=25.0)
-                output = fb_stderr.decode(errors="replace")
-                dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
-                if dur_match:
-                    h2, m2, s2 = dur_match.groups()
+                _, fb_stderr = await asyncio.wait_for(fb_proc.communicate(), timeout=20.0)
+                output = (fb_stderr or b"").decode(errors="replace")
+                dur_m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
+                if dur_m:
+                    h2, m2, s2 = dur_m.groups()
                     meta['duration'] = int(int(h2) * 3600 + int(m2) * 60 + float(s2))
-                vid_match = re.search(r'Stream[^\n]*Video:[^\n]*(\d{2,5})x(\d{2,5})', output)
-                if vid_match:
-                    meta['width'] = int(vid_match.group(1))
-                    meta['height'] = int(vid_match.group(2))
-                logger.info(f"ffmpeg stderr stream metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
-                if meta['duration'] == 0:
-                    # Log the raw ffmpeg output so we can debug further if still failing
-                    logger.warning(f"ffmpeg probe returned no duration. stderr tail: {output[-500:]}")
+                vid_m = re.search(r'Stream[^\n]*Video:[^\n]*(\d{2,5})x(\d{2,5})', output)
+                if vid_m:
+                    meta['width'], meta['height'] = int(vid_m.group(1)), int(vid_m.group(2))
+                if meta['duration'] > 0:
+                    logger.info(f"ffmpeg URL stderr metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
+                else:
+                    logger.warning(
+                        f"ffmpeg URL probe returned no duration (imageio_ffmpeg likely has no HTTP support). "
+                        f"Will use partial chunk download fallback."
+                    )
             except Exception as e2:
-                logger.warning(f"ffmpeg stream probe also failed: {e2}")
+                logger.warning(f"ffmpeg URL probe failed: {e2}")
 
-        # ── 2. Extract thumbnail ───────────────────────────────────────────────
-        seek_time = "00:00:01.000"
-        if meta['duration'] > 2:
-            mid = meta['duration'] // 2
-            seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
+        # ── Path A thumbnail: try URL-based thumbnail if duration was resolved ──
+        if meta['duration'] > 0:
+            seek_time = "00:00:01.000"
+            if meta['duration'] > 2:
+                mid = meta['duration'] // 2
+                seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
+            vf = (
+                "scale=320:320:force_original_aspect_ratio=decrease,"
+                "pad=320:320:(ow-iw)/2:(oh-ih)/2,"
+                "format=yuvj420p"
+            )
+            try:
+                t_proc = await asyncio.create_subprocess_exec(
+                    _get_ffmpeg(), "-hide_banner", "-y",
+                    "-ss", seek_time, *hdr_args, "-i", url,
+                    "-vframes", "1", "-vf", vf, "-vcodec", "mjpeg", "-q:v", "3",
+                    str(thumb_path),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _, t_stderr = await asyncio.wait_for(t_proc.communicate(), timeout=60.0)
+                has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
+                if has_thumb:
+                    logger.info(f"Stream thumbnail (URL path): {thumb_path.name} ({thumb_path.stat().st_size//1024} KB)")
+            except Exception as te:
+                logger.warning(f"URL-based thumbnail failed: {te}")
 
-        # Linux-safe video filter: scale + pad to even 320x320, explicit yuvj420p pixel format
-        stream_vf = (
-            "scale=320:320:force_original_aspect_ratio=decrease,"
-            "pad=320:320:(ow-iw)/2:(oh-ih)/2,"
-            "format=yuvj420p"
-        )
-        thumb_cmd = [
-            _get_ffmpeg(), "-hide_banner", "-y",
-            # INPUT seek for HTTP streams: ffmpeg uses HTTP byte-range requests to jump
-            # directly to the target time — this is fast and doesn't download from byte 0.
-            # (Output seek = -ss after -i = decodes from byte 0, which hangs on large streams)
-            "-ss", seek_time,
-            *hdr_args,
-            "-i", url,
-            "-vframes", "1",
-            "-vf", stream_vf,
-            "-vcodec", "mjpeg",
-            "-q:v", "3",
-            str(thumb_path)
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *thumb_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
-            has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
-            if has_thumb:
-                size_kb = thumb_path.stat().st_size // 1024
-                logger.info(f"Stream thumbnail generated: {thumb_path.name} ({size_kb} KB), meta={meta}")
-            else:
-                err_out = stderr.decode(errors="replace")[-1500:] if stderr else "(no output)"
-                logger.warning(f"Stream thumbnail NOT generated. ffmpeg stderr: {err_out}")
-        except asyncio.TimeoutError:
-            try: proc.kill()
-            except Exception: pass
-            logger.warning(f"ffmpeg thumbnail extraction timed out for {url[:80]}")
+        # ── Path B: Partial chunk download fallback ───────────────────────────
+        # Used when imageio_ffmpeg can't open HTTP URLs (no HTTP protocol built in).
+        # httpx always works for HTTP; we download the first 4 MB which contains:
+        #   - The MP4 moov atom (container header) → duration + dimensions
+        #   - The first video keyframe → thumbnail
+        if meta['duration'] == 0 or not has_thumb:
+            logger.info("Using partial chunk download for metadata/thumbnail (imageio_ffmpeg HTTP fallback)...")
+            try:
+                chunk_size = 4 * 1024 * 1024  # 4 MB — enough for moov atom + first keyframe
+                partial_path = thumb_path.with_suffix(".part.mp4")
+
+                req_headers = dict(effective_headers)
+                req_headers["Range"] = f"bytes=0-{chunk_size - 1}"
+
+                async with httpx.AsyncClient(timeout=30.0) as hc:
+                    resp = await hc.get(url, headers=req_headers)
+
+                if resp.status_code in (200, 206) and len(resp.content) > 1024:
+                    partial_path.write_bytes(resp.content)
+                    logger.info(f"Downloaded partial chunk: {len(resp.content)//1024} KB → {partial_path.name}")
+
+                    # Probe the local chunk for metadata
+                    if meta['duration'] == 0:
+                        chunk_meta = get_video_metadata(partial_path)
+                        if chunk_meta['width'] > 0:
+                            meta['width'] = chunk_meta['width']
+                            meta['height'] = chunk_meta['height']
+                        if chunk_meta['duration'] > 0:
+                            meta['duration'] = chunk_meta['duration']
+                        logger.info(f"Chunk metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
+
+                    # Extract thumbnail from local chunk (first frame — always in first few KB)
+                    if not has_thumb:
+                        has_thumb = await generate_thumbnail(
+                            partial_path, thumb_path,
+                            duration=meta.get('duration', 0)
+                        )
+                        if has_thumb:
+                            logger.info(f"Thumbnail from partial chunk: {thumb_path.name} ({thumb_path.stat().st_size//1024} KB)")
+                        else:
+                            logger.warning("Thumbnail generation from partial chunk also failed.")
+                else:
+                    logger.warning(f"Partial chunk download failed: HTTP {resp.status_code}, {len(resp.content)} bytes")
+
+            except Exception as chunk_err:
+                logger.warning(f"Partial chunk fallback failed: {chunk_err}")
+
     except Exception as e:
         logger.warning(f"Stream thumbnail/metadata extraction failed: {e}")
+    finally:
+        # Clean up temp partial file
+        if partial_path and partial_path.exists():
+            try:
+                partial_path.unlink()
+            except Exception:
+                pass
 
     return meta, has_thumb
 
