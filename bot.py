@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import asyncio
 import logging
 import shutil
@@ -14,6 +15,10 @@ from tqdm import tqdm
 
 import subprocess
 import re
+
+# Setup logging as early as possible — before any other imports that may emit warnings
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 import hachoir.core.config
@@ -80,12 +85,9 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 MAX_UPLOAD_RETRIES = 3
 RETRY_DELAY = 5
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-# Initialize Telethon Client
-client = TelegramClient("uploader_bot_session", API_ID, API_HASH)
+# Initialize Telethon Client — use absolute path so CWD doesn't matter on Linux/Railway
+_SESSION_PATH = str(Path(__file__).parent / "uploader_bot_session")
+client = TelegramClient(_SESSION_PATH, API_ID, API_HASH)
 
 # State management for interactive flow
 USER_STATES = {}
@@ -156,21 +158,24 @@ def get_ffmpeg_cmd() -> str:
     """
     Resolve the best available ffmpeg binary.
     Priority:
-      1. System 'ffmpeg' on PATH  (installed via nixpacks.toml on Railway)
-      2. imageio_ffmpeg bundled binary (fallback for local dev)
+      1. System 'ffmpeg' resolved to its FULL PATH via shutil.which (critical on Linux/Ubuntu
+         where asyncio subprocesses may not inherit the same PATH as the shell).
+      2. imageio_ffmpeg bundled binary (fallback for local dev without system ffmpeg).
     Logs which binary is being used so Railway logs make it obvious.
     """
-    # Try system ffmpeg first — fastest & most reliable on Linux/Railway
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3
-        )
-        if result.returncode == 0:
-            logger.info("ffmpeg: using system binary (PATH)")
-            return "ffmpeg"
-    except Exception:
-        pass
+    # Try system ffmpeg first — resolve to full absolute path for reliable subprocess exec on Linux
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        try:
+            result = subprocess.run(
+                [ffmpeg_path, "-version"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+            )
+            if result.returncode == 0:
+                logger.info(f"ffmpeg: using system binary at {ffmpeg_path}")
+                return ffmpeg_path
+        except Exception:
+            pass
 
     # Fall back to imageio_ffmpeg bundled binary
     try:
@@ -195,16 +200,86 @@ def _get_ffmpeg() -> str:
     return _FFMPEG_CMD
 
 
+def _get_ffprobe() -> str:
+    """
+    Resolve the ffprobe binary (same directory as ffmpeg).
+    ffprobe is the CORRECT tool for metadata: it outputs structured JSON,
+    unlike ffmpeg whose stderr format varies across Linux distro builds.
+    """
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path:
+        return ffprobe_path
+    # If imageio_ffmpeg is installed its bundle may include ffprobe next to ffmpeg
+    ffmpeg_bin = _get_ffmpeg()
+    candidate = os.path.join(os.path.dirname(ffmpeg_bin), "ffprobe")
+    if os.path.isfile(candidate):
+        return candidate
+    return "ffprobe"  # last-resort guess
+
+
 def _extract_ffmpeg_metadata(filepath):
-    """Extract duration, width, and height using ffmpeg (robust against non-standard MP4 atoms)."""
+    """
+    Extract duration, width, and height using ffprobe JSON output.
+
+    Why ffprobe instead of parsing ffmpeg stderr:
+      - ffprobe outputs stable, locale-independent JSON (no regex on human-readable text).
+      - ffmpeg stderr format varies across Ubuntu LTS builds and may omit or reorder fields.
+      - This is the approach recommended by the ffmpeg project itself for metadata extraction.
+    Falls back to regex on ffmpeg stderr if ffprobe is unavailable.
+    """
     meta = {'duration': 0, 'width': 0, 'height': 0}
+    filepath = str(filepath)
+
+    # --- Primary: ffprobe JSON ---
+    try:
+        ffprobe = _get_ffprobe()
+        res = subprocess.run(
+            [
+                ffprobe, "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-show_format",
+                filepath
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        data = json.loads(res.stdout or b"{}")
+
+        # Duration: prefer format-level (most accurate), fall back to stream-level
+        fmt_dur = data.get("format", {}).get("duration", "")
+        if fmt_dur and fmt_dur not in ("", "N/A"):
+            meta["duration"] = int(float(fmt_dur))
+
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                w = stream.get("width", 0)
+                h = stream.get("height", 0)
+                if w and h:
+                    meta["width"] = int(w)
+                    meta["height"] = int(h)
+                # Stream-level duration as fallback
+                if not meta["duration"]:
+                    s_dur = stream.get("duration", "")
+                    if s_dur and s_dur not in ("", "N/A"):
+                        meta["duration"] = int(float(s_dur))
+                break  # first video stream is enough
+
+        if meta["duration"] > 0:
+            logger.info(f"ffprobe metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
+            return meta
+    except Exception as e:
+        logger.warning(f"ffprobe metadata extraction failed for {filepath}: {e}")
+
+    # --- Fallback: regex on ffmpeg stderr (legacy, less reliable on Linux) ---
     try:
         res = subprocess.run(
-            [_get_ffmpeg(), "-hide_banner", "-i", str(filepath)],
+            [_get_ffmpeg(), "-hide_banner", "-i", filepath],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=8,
+            timeout=10,
             errors="replace"
         )
         output = (res.stderr or "") + " " + (res.stdout or "")
@@ -212,12 +287,13 @@ def _extract_ffmpeg_metadata(filepath):
         if dur_match:
             h, m, s = dur_match.groups()
             meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
-        vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
+        # Anchored regex: match WxH only inside a Video stream line to avoid false positives
+        vid_match = re.search(r'Stream[^\n]*Video:[^\n]*(\d{2,5})x(\d{2,5})', output)
         if vid_match:
             meta['width'] = int(vid_match.group(1))
             meta['height'] = int(vid_match.group(2))
     except Exception as e:
-        logger.warning(f"ffmpeg metadata extraction failed for {filepath}: {e}")
+        logger.warning(f"ffmpeg fallback metadata extraction failed for {filepath}: {e}")
     return meta
 
 def get_video_metadata(filepath):
@@ -248,25 +324,50 @@ def get_video_metadata(filepath):
 
 
 async def generate_thumbnail(filepath, thumb_path, duration=0):
-    """Generate a thumbnail for the video using ffmpeg, scaled to <=320x320 JPEG."""
+    """
+    Generate a thumbnail for the video using ffmpeg, scaled to <=320x320 JPEG.
+
+    Linux/Ubuntu-safe fixes applied:
+      - Seek AFTER -i (output seek) for accurate frame extraction on any container.
+      - Explicit -vcodec mjpeg + -f image2 so Ubuntu ffmpeg always writes a valid JPEG.
+      - Pad filter ensures even pixel dimensions (avoids encoder failures on odd sizes).
+      - asyncio.wait_for timeout prevents indefinite hangs on slow/corrupt files.
+    """
     seek_time = "00:00:01.000"
     if duration > 2:
         mid = int(duration) // 2
         seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
-        
+
+    # scale=w:h:force_original_aspect_ratio=decrease keeps aspect ratio,
+    # pad=320:320:(ow-iw)/2:(oh-ih)/2 pads to exact 320x320 with black bars (avoids odd-dimension crash),
+    # format=yuvj420p ensures Linux mjpeg encoder accepts the input pixel format.
+    vf = (
+        "scale=320:320:force_original_aspect_ratio=decrease,"
+        "pad=320:320:(ow-iw)/2:(oh-ih)/2,"
+        "format=yuvj420p"
+    )
+
     try:
         process = await asyncio.create_subprocess_exec(
             _get_ffmpeg(), '-hide_banner', '-y',
-            '-ss', seek_time,
-            '-i', str(filepath),
+            '-i', str(filepath),      # <-- -i FIRST
+            '-ss', seek_time,          # <-- -ss AFTER -i = output seek (accurate on all Linux containers)
             '-vframes', '1',
-            '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
-            '-q:v', '5',
+            '-vf', vf,
+            '-vcodec', 'mjpeg',        # explicit JPEG encoder (required on some Ubuntu builds)
+            '-q:v', '3',               # quality 3 (1–31, lower=better); 5 was sometimes too low
             str(thumb_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        _, stderr = await process.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
+        except asyncio.TimeoutError:
+            try: process.kill()
+            except Exception: pass
+            logger.warning(f"Thumbnail generation timed out for {filepath}")
+            return False
+
         exists = thumb_path.exists() and thumb_path.stat().st_size > 0
         if exists:
             size_kb = thumb_path.stat().st_size // 1024
@@ -293,34 +394,71 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             hdr_args = ["-headers", headers_str]
 
-        # 1. Probe stream for metadata
-        probe_cmd = [
-            _get_ffmpeg(), "-hide_banner",
-            *hdr_args,
-            "-i", url
+        # 1. Probe stream for metadata using ffprobe JSON (reliable on all Linux/Ubuntu builds)
+        ffprobe = _get_ffprobe()
+        ffprobe_cmd = [
+            ffprobe, "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_format",
         ]
+        if hdr_args:
+            # ffprobe accepts -headers the same way as ffmpeg
+            ffprobe_cmd += hdr_args
+        ffprobe_cmd.append(url)
+
         probe_proc = await asyncio.create_subprocess_exec(
-            *probe_cmd,
+            *ffprobe_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         try:
-            _, stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=20.0)
-            output = stderr.decode(errors="replace")
+            probe_stdout, _ = await asyncio.wait_for(probe_proc.communicate(), timeout=25.0)
+            probe_data = json.loads(probe_stdout or b"{}")
+
+            # Duration: prefer format-level, fall back to video stream-level
+            fmt_dur = probe_data.get("format", {}).get("duration", "")
+            if fmt_dur and fmt_dur not in ("", "N/A"):
+                meta["duration"] = int(float(fmt_dur))
+
+            for stream in probe_data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    w = stream.get("width", 0)
+                    h = stream.get("height", 0)
+                    if w and h:
+                        meta["width"] = int(w)
+                        meta["height"] = int(h)
+                    if not meta["duration"]:
+                        s_dur = stream.get("duration", "")
+                        if s_dur and s_dur not in ("", "N/A"):
+                            meta["duration"] = int(float(s_dur))
+                    break
+
+            logger.info(f"ffprobe stream metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
         except asyncio.TimeoutError:
             try: probe_proc.kill()
             except Exception: pass
-            output = ""
-            logger.warning(f"ffmpeg stream probing timed out for {url[:80]}")
-
-        dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
-        if dur_match:
-            h, m, s = dur_match.groups()
-            meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
-        vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
-        if vid_match:
-            meta['width'] = int(vid_match.group(1))
-            meta['height'] = int(vid_match.group(2))
+            logger.warning(f"ffprobe stream probing timed out for {url[:80]}")
+        except Exception as e:
+            logger.warning(f"ffprobe stream probe failed ({e}), trying ffmpeg stderr fallback for {url[:80]}")
+            # Fallback: regex on ffmpeg stderr (less reliable on Ubuntu but better than nothing)
+            try:
+                fb_proc = await asyncio.create_subprocess_exec(
+                    _get_ffmpeg(), "-hide_banner", *hdr_args, "-i", url,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _, fb_stderr = await asyncio.wait_for(fb_proc.communicate(), timeout=20.0)
+                output = fb_stderr.decode(errors="replace")
+                dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
+                if dur_match:
+                    h2, m2, s2 = dur_match.groups()
+                    meta['duration'] = int(int(h2) * 3600 + int(m2) * 60 + float(s2))
+                vid_match = re.search(r'Stream[^\n]*Video:[^\n]*(\d{2,5})x(\d{2,5})', output)
+                if vid_match:
+                    meta['width'] = int(vid_match.group(1))
+                    meta['height'] = int(vid_match.group(2))
+            except Exception as e2:
+                logger.warning(f"ffmpeg stream fallback probe also failed: {e2}")
 
         # 2. Extract middle frame thumbnail
         seek_time = "00:00:01.000"
@@ -328,14 +466,21 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
             mid = meta['duration'] // 2
             seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
 
+        # Linux-safe video filter: scale + pad to even 320x320, explicit yuvj420p pixel format
+        stream_vf = (
+            "scale=320:320:force_original_aspect_ratio=decrease,"
+            "pad=320:320:(ow-iw)/2:(oh-ih)/2,"
+            "format=yuvj420p"
+        )
         thumb_cmd = [
             _get_ffmpeg(), "-hide_banner", "-y",
             *hdr_args,
-            "-ss", seek_time,
-            "-i", url,
+            "-i", url,           # -i FIRST
+            "-ss", seek_time,     # -ss AFTER -i = output seek (accurate on Linux)
             "-vframes", "1",
-            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-            "-q:v", "5",
+            "-vf", stream_vf,
+            "-vcodec", "mjpeg",  # explicit JPEG encoder for Ubuntu compatibility
+            "-q:v", "3",
             str(thumb_path)
         ]
         proc = await asyncio.create_subprocess_exec(
@@ -502,7 +647,6 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
         async def status_updater():
             last_text = ""
             while state["running"]:
-                processed = state["uploaded"] + state["skipped"] + state["failed"]
                 text = (
                     f"📊 <b>Pipeline Progress ({'⚡ RAM Stream' if ENABLE_STREAM_UPLOAD else '💾 Disk Pipeline'}):</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -660,11 +804,16 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     await BAR_MANAGER.release_pos(pos)
 
         async def stream_pipeline_worker(vid):
+            # BUG-6 FIX: Copy the vid dict to prevent concurrent workers from racing
+            # to mutate the same shared dict object from the videos list.
+            vid = dict(vid)
             if 'name' not in vid or not vid['name'].lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v')):
                 vid['name'] = (vid.get('name') or 'video') + '.mp4'
-                
+
             pos = await BAR_MANAGER.get_pos()
             vid_name = vid['name']
+            # BUG-7 FIX: Track if disk fallback was used so we don't double-release pos
+            _used_disk_fallback = False
             state["active_uploads"][vid_name] = "<code>[Connecting Stream...] ⏳</code>"
 
             last_pbar_time = [0.0]
@@ -684,6 +833,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     return
                 elif status == "error_html" or not info.get("url") or not info.get("file_size"):
                     logger.warning(f"Stream resolution unavailable for {vid_name} ({info.get('error', 'no length')}). Falling back to disk pipeline...")
+                    _used_disk_fallback = True
                     await disk_pipeline_worker(vid, pos)
                     return
 
@@ -708,12 +858,20 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 try:
                                     conv_proc = await asyncio.create_subprocess_exec(
                                         _get_ffmpeg(), '-y', '-i', str(raw_thumb),
-                                        '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
-                                        '-q:v', '5', str(thumb_path),
+                                        '-vf', (
+                                            'scale=320:320:force_original_aspect_ratio=decrease,'
+                                            'pad=320:320:(ow-iw)/2:(oh-ih)/2,'
+                                            'format=yuvj420p'
+                                        ),
+                                        '-vcodec', 'mjpeg', '-q:v', '3', str(thumb_path),
                                         stdout=asyncio.subprocess.PIPE,
                                         stderr=asyncio.subprocess.PIPE
                                     )
-                                    await conv_proc.communicate()
+                                    try:
+                                        await asyncio.wait_for(conv_proc.communicate(), timeout=20.0)
+                                    except asyncio.TimeoutError:
+                                        try: conv_proc.kill()
+                                        except Exception: pass
                                     has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
                                     logger.info(f"Fallback thumbnail from URL: has_thumb={has_thumb}")
                                 finally:
@@ -766,6 +924,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     except Exception as e:
                         if attempt == MAX_UPLOAD_RETRIES:
                             logger.warning(f"Stream upload failed for {vid_name} after {MAX_UPLOAD_RETRIES} attempts: {e}. Falling back to disk pipeline...")
+                            _used_disk_fallback = True
                             await disk_pipeline_worker(vid, pos)
                             return
                         logger.warning(f"Stream attempt {attempt} failed for {vid_name}: {e}. Retrying in {RETRY_DELAY}s...")
@@ -796,7 +955,9 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 if has_thumb and thumb_path and thumb_path.exists():
                     try: os.remove(thumb_path)
                     except Exception: pass
-                await BAR_MANAGER.release_pos(pos)
+                # BUG-7 FIX: Only release BAR pos if disk_pipeline_worker didn't already take ownership
+                if not _used_disk_fallback:
+                    await BAR_MANAGER.release_pos(pos)
 
         if ENABLE_STREAM_UPLOAD:
             # Direct RAM-buffered streaming pipeline (zero disk usage for media files)
@@ -850,6 +1011,9 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
                     vid, filepath = item
                     pos = await BAR_MANAGER.get_pos()
+                    # BUG-2/3 FIX: Pre-initialize so finally block never hits NameError
+                    thumb_path = None
+                    has_thumb = False
                     try:
                         file_size = filepath.stat().st_size
                         state["active_uploads"][vid['name']] = "<code>[Processing Metadata...] ⚙️</code>"
@@ -862,7 +1026,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
                         metadata = get_video_metadata(filepath)
                         thumb_path = filepath.with_suffix('.jpg')
-                        has_thumb = await generate_thumbnail(filepath, thumb_path)
+                        # BUG-1 FIX: Pass duration so seek lands on the correct frame
+                        has_thumb = await generate_thumbnail(filepath, thumb_path, duration=metadata.get('duration', 0))
                         attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
 
                         ai_meta = await generate_ai_caption(vid, service, cur_user_id)
@@ -917,12 +1082,13 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         state["failed"] += 1
                     finally:
                         state["active_uploads"].pop(vid['name'], None)
-                        if has_thumb and thumb_path.exists():
+                        # BUG-2/3 FIX: Guard with 'and thumb_path' to avoid NameError
+                        if has_thumb and thumb_path and thumb_path.exists():
                             try: os.remove(thumb_path)
-                            except: pass
-                        if filepath.exists():
+                            except Exception: pass
+                        if filepath and filepath.exists():
                             try: os.remove(filepath)
-                            except: pass
+                            except Exception: pass
                         await BAR_MANAGER.release_pos(pos)
                         upload_queue.task_done()
 
@@ -934,7 +1100,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
             await asyncio.gather(*[bounded_download(v) for v in videos])
 
-            for _ in range(2):
+            # BUG-4 FIX: Send exactly 1 sentinel per upload_worker (only 1 worker was created)
+            for _ in upload_tasks:
                 await upload_queue.put(None)
             await asyncio.gather(*upload_tasks)
 
@@ -1028,9 +1195,11 @@ async def start_handler(event):
     ])
     buttons.append([Button.inline("❓ Help Guide", b"help")])
     
-    # Safe storage channel button
-    storage_link = f"https://t.me/c/{str(abs(STORAGE_CHANNEL_ID))[3:]}" if STORAGE_CHANNEL_ID and str(STORAGE_CHANNEL_ID).startswith("-100") else None
-    if storage_link:
+    # BUG-9 FIX: Build t.me/c/ URL correctly — strip the leading "-100" prefix (4 chars)
+    # e.g. -1001234567890 → 1234567890 → https://t.me/c/1234567890
+    if STORAGE_CHANNEL_ID and str(STORAGE_CHANNEL_ID).startswith("-100"):
+        channel_number = str(STORAGE_CHANNEL_ID)[4:]  # remove "-100" prefix (4 chars, not 3)
+        storage_link = f"https://t.me/c/{channel_number}"
         buttons.append([Button.url("📂 View Storage Channel", storage_link)])
     
     await event.respond(text, parse_mode='html', buttons=buttons)
