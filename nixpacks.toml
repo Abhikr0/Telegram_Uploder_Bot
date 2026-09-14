@@ -1,0 +1,7 @@
+[phases.setup]
+# Include system ffmpeg alongside default Nix packages (Python, pip, etc.)
+# The "..." preserves the defaults; without it, Python itself would be dropped.
+nixPkgs = ["...", "ffmpeg"]
+
+[start]
+cmd = "python bot.py"
