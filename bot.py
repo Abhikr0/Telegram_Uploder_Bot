@@ -512,11 +512,14 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
         # Pipeline worker definitions
         async def disk_pipeline_worker(vid, pos=None):
+            if 'name' not in vid or not vid['name'].lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v')):
+                vid['name'] = (vid.get('name') or 'video') + '.mp4'
+                
             need_release = False
             if pos is None:
                 pos = await BAR_MANAGER.get_pos()
                 need_release = True
-            vid_name = vid.get('name') or vid.get('title') or "video"
+            vid_name = vid['name']
             state["active_downloads"][vid_name] = "<code>[Connecting...] ⏳</code>"
 
             last_dl_pbar_time = [0.0]
@@ -581,7 +584,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 supports_streaming=True,
                                 attributes=attributes,
                                 thumb=str(thumb_path) if has_thumb else None,
-                                video=True
+                                force_document=False,
+                                mime_type='video/mp4'
                             )
                         break
                     except Exception as e:
@@ -623,8 +627,11 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     await BAR_MANAGER.release_pos(pos)
 
         async def stream_pipeline_worker(vid):
+            if 'name' not in vid or not vid['name'].lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v')):
+                vid['name'] = (vid.get('name') or 'video') + '.mp4'
+                
             pos = await BAR_MANAGER.get_pos()
-            vid_name = vid.get('name') or vid.get('title') or "video"
+            vid_name = vid['name']
             state["active_uploads"][vid_name] = "<code>[Connecting Stream...] ⏳</code>"
 
             last_pbar_time = [0.0]
@@ -651,6 +658,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 stream_headers = info["headers"]
                 file_size = info["file_size"]
                 stream_filename = info.get("name") or f"{vid['id']}_{vid_name}"
+                if not stream_filename.lower().endswith('.mp4'):
+                    stream_filename += '.mp4'
 
                 state["active_uploads"][vid_name] = "<code>[Probing Stream...] ⚙️</code>"
                 thumb_path = temp_dir / f"{vid['id']}_thumb.jpg"
@@ -716,7 +725,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 supports_streaming=True,
                                 attributes=attributes,
                                 thumb=str(thumb_path) if has_thumb else None,
-                                video=True
+                                force_document=False,
+                                mime_type='video/mp4'
                             )
                         break
                     except Exception as e:
