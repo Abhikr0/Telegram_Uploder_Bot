@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 import logging
 import html
 from typing import Dict, Any, List, Optional
@@ -113,6 +114,7 @@ async def generate_ai_caption(vid: Dict[str, Any], service: str, creator: str) -
     """
     Generates rich metadata, descriptive title, summary, and hashtags using Mistral AI.
     Falls back gracefully to standard metadata if Mistral API key is not configured or errors.
+    Retries automatically on 429 (rate limit) with exponential backoff.
     """
     api_key = os.getenv("MISTRAL_API_KEY", "").strip()
     model = os.getenv("MISTRAL_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
@@ -147,85 +149,109 @@ async def generate_ai_caption(vid: Dict[str, Any], service: str, creator: str) -
         '{"clean_title": "...", "summary": "...", "hashtags": ["#...", "#..."]}'
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=7.0) as http_client:
-            response = await http_client.post(
-                MISTRAL_API_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": json.dumps(prompt_user)}
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.3
-                }
-            )
+    MAX_RETRIES = 3
+    BASE_DELAY = 2.0  # seconds; doubles each retry: 2s, 4s, 8s
 
-        if response.status_code != 200:
-            logger.warning(f"Mistral API returned status {response.status_code}: {response.text[:150]}")
-            return fallback
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http_client:
+                response = await http_client.post(
+                    MISTRAL_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": json.dumps(prompt_user)}
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.3
+                    }
+                )
 
-        data = response.json()
-        ai_message = data["choices"][0]["message"]["content"]
-        parsed = json.loads(ai_message)
+            if response.status_code == 429 or response.status_code == 503:
+                # Rate limited or overloaded — respect Retry-After header if present, else backoff
+                retry_after = float(response.headers.get("Retry-After", BASE_DELAY * (2 ** (attempt - 1))))
+                retry_after = min(retry_after, 30.0)  # cap at 30s so we don't stall uploads
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        f"Mistral API {response.status_code} on attempt {attempt}/{MAX_RETRIES}. "
+                        f"Retrying in {retry_after:.1f}s..."
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                else:
+                    logger.warning(f"Mistral API rate limited after {MAX_RETRIES} attempts. Using fallback caption.")
+                    return fallback
 
-        clean_title = (parsed.get("clean_title") or fallback["clean_title"]).strip()
-        summary = (parsed.get("summary") or fallback["summary"]).strip()
-        raw_hashtags = parsed.get("hashtags") or fallback["hashtags"]
+            if response.status_code != 200:
+                logger.warning(f"Mistral API returned status {response.status_code}: {response.text[:150]}")
+                return fallback
 
-        # Ensure valid hashtags
-        hashtags: List[str] = []
-        for tag in raw_hashtags:
-            st = _sanitize_hashtag(tag)
-            if st and st not in hashtags:
-                hashtags.append(st)
+            data = response.json()
+            ai_message = data["choices"][0]["message"]["content"]
+            parsed = json.loads(ai_message)
 
-        # Merge all broken name tags so every filename token is indexed
-        for nt in extract_name_tags(raw_title):
-            if nt not in hashtags:
-                hashtags.append(nt)
+            clean_title = (parsed.get("clean_title") or fallback["clean_title"]).strip()
+            summary = (parsed.get("summary") or fallback["summary"]).strip()
+            raw_hashtags = parsed.get("hashtags") or fallback["hashtags"]
 
-        # Always guarantee creator and service tags exist for Telegram search
-        srv_tag = _sanitize_hashtag(service)
-        cr_tag = _sanitize_hashtag(creator.replace("-", "_").replace(" ", "_"))
-        if srv_tag and srv_tag not in hashtags:
-            hashtags.insert(0, srv_tag)
-        if cr_tag and cr_tag not in hashtags:
-            hashtags.insert(1, cr_tag)
+            # Ensure valid hashtags
+            hashtags: List[str] = []
+            for tag in raw_hashtags:
+                st = _sanitize_hashtag(tag)
+                if st and st not in hashtags:
+                    hashtags.append(st)
 
-        # Build rich HTML caption
-        caption_parts = [f"🎥 <b>{_escape(clean_title[:80])}</b>"]
-        if summary:
-            caption_parts.append(f"📝 <i>{_escape(summary[:150])}</i>")
-        caption_parts.append(f"👤 {_escape(service)}/{_escape(creator)}\n🆔 <code>{_escape(vid_id)}</code>")
-        if hashtags:
-            caption_parts.append(f"🏷️ {' '.join(hashtags[:10])}")
+            # Merge all broken name tags so every filename token is indexed
+            for nt in extract_name_tags(raw_title):
+                if nt not in hashtags:
+                    hashtags.append(nt)
 
-        rich_caption = "\n\n".join(caption_parts)
+            # Always guarantee creator and service tags exist for Telegram search
+            srv_tag = _sanitize_hashtag(service)
+            cr_tag = _sanitize_hashtag(creator.replace("-", "_").replace(" ", "_"))
+            if srv_tag and srv_tag not in hashtags:
+                hashtags.insert(0, srv_tag)
+            if cr_tag and cr_tag not in hashtags:
+                hashtags.insert(1, cr_tag)
 
-        # Keep strictly under Telegram's 1024 character caption limit
-        if len(rich_caption) > 1000:
-            # Truncate summary if necessary
-            summary = summary[:80] + "..."
-            caption_parts[1] = f"📝 <i>{_escape(summary)}</i>"
+            # Build rich HTML caption
+            caption_parts = [f"🎥 <b>{_escape(clean_title[:80])}</b>"]
+            if summary:
+                caption_parts.append(f"📝 <i>{_escape(summary[:150])}</i>")
+            caption_parts.append(f"👤 {_escape(service)}/{_escape(creator)}\n🆔 <code>{_escape(vid_id)}</code>")
+            if hashtags:
+                caption_parts.append(f"🏷️ {' '.join(hashtags[:10])}")
+
             rich_caption = "\n\n".join(caption_parts)
 
-        db_title = f"{clean_title[:90]} {' '.join(hashtags[:12])}"
+            # Keep strictly under Telegram's 1024 character caption limit
+            if len(rich_caption) > 1000:
+                summary = summary[:80] + "..."
+                caption_parts[1] = f"📝 <i>{_escape(summary)}</i>"
+                rich_caption = "\n\n".join(caption_parts)
 
-        logger.info(f"Generated AI metadata for '{clean_title}' with {len(hashtags)} hashtags.")
-        return {
-            "clean_title": clean_title[:100],
-            "summary": summary,
-            "hashtags": hashtags,
-            "rich_caption": rich_caption,
-            "db_title": db_title[:240]
-        }
+            db_title = f"{clean_title[:90]} {' '.join(hashtags[:12])}"
 
-    except Exception as e:
-        logger.warning(f"Error calling Mistral AI for metadata: {e}. Falling back to default caption.")
-        return fallback
+            logger.info(f"Generated AI metadata for '{clean_title}' with {len(hashtags)} hashtags.")
+            return {
+                "clean_title": clean_title[:100],
+                "summary": summary,
+                "hashtags": hashtags,
+                "rich_caption": rich_caption,
+                "db_title": db_title[:240]
+            }
+
+        except Exception as e:
+            logger.warning(f"Error calling Mistral AI (attempt {attempt}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(BASE_DELAY * (2 ** (attempt - 1)))
+            else:
+                logger.warning("Mistral AI failed after all retries. Falling back to default caption.")
+                return fallback
+
+    return fallback  # unreachable but satisfies type checker

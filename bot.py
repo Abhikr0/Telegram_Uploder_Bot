@@ -1,34 +1,26 @@
+# ── Standard Library Imports ─────────────────────────────────────────────────
 import os
 import sys
 import json
 import asyncio
 import logging
 import shutil
+import subprocess
+import re
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from dotenv import load_dotenv
-from telethon import TelegramClient, events, Button, functions, types, errors
-from telethon.tl.types import DocumentAttributeVideo, BotCommand, BotCommandScopeDefault
-from tqdm import tqdm
 
-import subprocess
-import re
-
-# Setup logging as early as possible — before any other imports that may emit warnings
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# Setup logging immediately after stdlib — before any third-party imports
+# so all library warnings are captured by our configured handler.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
-from hachoir.metadata import extractMetadata
-from hachoir.parser import createParser
-import hachoir.core.config
 
-# Silence noisy hachoir parser warnings (e.g. non-standard MP4 atoms)
-hachoir.core.config.quiet = True
-
-
-
-# Fix Windows console UTF-8 emoji printing
+# Fix Windows console UTF-8 emoji printing (must be before any print/log calls)
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -36,21 +28,29 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Import fasttelethon from local file
-from fasttelethon import upload_file, upload_http_stream
-
-# Import AI caption & metadata generator
-from ai_caption import generate_ai_caption
-
+# ── Third-Party Imports ───────────────────────────────────────────────────────
+from dotenv import load_dotenv
+from telethon import TelegramClient, events, Button, functions, types, errors
+from telethon.tl.types import DocumentAttributeVideo, BotCommand, BotCommandScopeDefault
+from tqdm import tqdm
 import httpx
 
-# Import scraper functions
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
+import hachoir.core.config
+
+# Silence noisy hachoir parser warnings (e.g. non-standard MP4 atoms)
+hachoir.core.config.quiet = True
+
+# ── Local Imports ─────────────────────────────────────────────────────────────
+from fasttelethon import upload_file, upload_http_stream
+from ai_caption import generate_ai_caption
 from scraper import (
     parse_media_url,
-    parse_profile_url, 
-    parse_page_range, 
-    fetch_all_posts, 
-    extract_video_urls, 
+    parse_profile_url,
+    parse_page_range,
+    fetch_all_posts,
+    extract_video_urls,
     download_video,
     resolve_media_stream_info
 )
@@ -200,21 +200,29 @@ def _get_ffmpeg() -> str:
     return _FFMPEG_CMD
 
 
-def _get_ffprobe() -> str:
+def _get_ffprobe() -> str | None:
     """
-    Resolve the ffprobe binary (same directory as ffmpeg).
-    ffprobe is the CORRECT tool for metadata: it outputs structured JSON,
-    unlike ffmpeg whose stderr format varies across Linux distro builds.
+    Resolve the ffprobe binary.
+    Returns the full path string if found, or None if unavailable.
+
+    NOTE: imageio_ffmpeg only bundles 'ffmpeg', NOT 'ffprobe'.
+    In that case this returns None and callers fall back to ffmpeg stderr parsing.
     """
+    # 1. System ffprobe on PATH (best case — e.g. apt install ffmpeg installs both)
     ffprobe_path = shutil.which("ffprobe")
     if ffprobe_path:
+        logger.info(f"ffprobe: using system binary at {ffprobe_path}")
         return ffprobe_path
-    # If imageio_ffmpeg is installed its bundle may include ffprobe next to ffmpeg
+    # 2. Check same directory as the resolved ffmpeg binary
+    #    (some custom builds ship both in the same folder)
     ffmpeg_bin = _get_ffmpeg()
     candidate = os.path.join(os.path.dirname(ffmpeg_bin), "ffprobe")
     if os.path.isfile(candidate):
+        logger.info(f"ffprobe: found alongside ffmpeg at {candidate}")
         return candidate
-    return "ffprobe"  # last-resort guess
+    # 3. Not available (imageio_ffmpeg only bundles ffmpeg) — callers must use ffmpeg fallback
+    logger.warning("ffprobe: binary not found. Metadata will use ffmpeg stderr parsing fallback.")
+    return None
 
 
 def _extract_ffmpeg_metadata(filepath):
@@ -230,47 +238,47 @@ def _extract_ffmpeg_metadata(filepath):
     meta = {'duration': 0, 'width': 0, 'height': 0}
     filepath = str(filepath)
 
-    # --- Primary: ffprobe JSON ---
-    try:
-        ffprobe = _get_ffprobe()
-        res = subprocess.run(
-            [
-                ffprobe, "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                "-show_format",
-                filepath
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
-        )
-        data = json.loads(res.stdout or b"{}")
+    # --- Primary: ffprobe JSON (preferred — stable structured output) ---
+    ffprobe = _get_ffprobe()  # returns None if not available (e.g. imageio_ffmpeg env)
+    if ffprobe:
+        try:
+            res = subprocess.run(
+                [
+                    ffprobe, "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_streams",
+                    "-show_format",
+                    filepath
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+            data = json.loads(res.stdout or b"{}")
 
-        # Duration: prefer format-level (most accurate), fall back to stream-level
-        fmt_dur = data.get("format", {}).get("duration", "")
-        if fmt_dur and fmt_dur not in ("", "N/A"):
-            meta["duration"] = int(float(fmt_dur))
+            # Duration: prefer format-level (most accurate), fall back to stream-level
+            fmt_dur = data.get("format", {}).get("duration", "")
+            if fmt_dur and fmt_dur not in ("", "N/A"):
+                meta["duration"] = int(float(fmt_dur))
 
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "video":
-                w = stream.get("width", 0)
-                h = stream.get("height", 0)
-                if w and h:
-                    meta["width"] = int(w)
-                    meta["height"] = int(h)
-                # Stream-level duration as fallback
-                if not meta["duration"]:
-                    s_dur = stream.get("duration", "")
-                    if s_dur and s_dur not in ("", "N/A"):
-                        meta["duration"] = int(float(s_dur))
-                break  # first video stream is enough
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    w = stream.get("width", 0)
+                    h = stream.get("height", 0)
+                    if w and h:
+                        meta["width"] = int(w)
+                        meta["height"] = int(h)
+                    if not meta["duration"]:
+                        s_dur = stream.get("duration", "")
+                        if s_dur and s_dur not in ("", "N/A"):
+                            meta["duration"] = int(float(s_dur))
+                    break
 
-        if meta["duration"] > 0:
-            logger.info(f"ffprobe metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
-            return meta
-    except Exception as e:
-        logger.warning(f"ffprobe metadata extraction failed for {filepath}: {e}")
+            if meta["duration"] > 0:
+                logger.info(f"ffprobe metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
+                return meta
+        except Exception as e:
+            logger.warning(f"ffprobe metadata extraction failed for {filepath}: {e}")
 
     # --- Fallback: regex on ffmpeg stderr (legacy, less reliable on Linux) ---
     try:
@@ -394,54 +402,58 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             hdr_args = ["-headers", headers_str]
 
-        # 1. Probe stream for metadata using ffprobe JSON (reliable on all Linux/Ubuntu builds)
-        ffprobe = _get_ffprobe()
-        ffprobe_cmd = [
-            ffprobe, "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            "-show_format",
-        ]
-        if hdr_args:
-            # ffprobe accepts -headers the same way as ffmpeg
-            ffprobe_cmd += hdr_args
-        ffprobe_cmd.append(url)
+        # 1. Probe stream for metadata
+        #    Use ffprobe JSON if available; fall back to ffmpeg stderr regex otherwise.
+        ffprobe = _get_ffprobe()  # None when only imageio_ffmpeg is installed
 
-        probe_proc = await asyncio.create_subprocess_exec(
-            *ffprobe_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        try:
-            probe_stdout, _ = await asyncio.wait_for(probe_proc.communicate(), timeout=25.0)
-            probe_data = json.loads(probe_stdout or b"{}")
+        if ffprobe:
+            ffprobe_cmd = [
+                ffprobe, "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-show_format",
+            ]
+            if hdr_args:
+                ffprobe_cmd += hdr_args
+            ffprobe_cmd.append(url)
 
-            # Duration: prefer format-level, fall back to video stream-level
-            fmt_dur = probe_data.get("format", {}).get("duration", "")
-            if fmt_dur and fmt_dur not in ("", "N/A"):
-                meta["duration"] = int(float(fmt_dur))
+            probe_proc = await asyncio.create_subprocess_exec(
+                *ffprobe_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                probe_stdout, _ = await asyncio.wait_for(probe_proc.communicate(), timeout=25.0)
+                probe_data = json.loads(probe_stdout or b"{}")
 
-            for stream in probe_data.get("streams", []):
-                if stream.get("codec_type") == "video":
-                    w = stream.get("width", 0)
-                    h = stream.get("height", 0)
-                    if w and h:
-                        meta["width"] = int(w)
-                        meta["height"] = int(h)
-                    if not meta["duration"]:
-                        s_dur = stream.get("duration", "")
-                        if s_dur and s_dur not in ("", "N/A"):
-                            meta["duration"] = int(float(s_dur))
-                    break
+                fmt_dur = probe_data.get("format", {}).get("duration", "")
+                if fmt_dur and fmt_dur not in ("", "N/A"):
+                    meta["duration"] = int(float(fmt_dur))
 
-            logger.info(f"ffprobe stream metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
-        except asyncio.TimeoutError:
-            try: probe_proc.kill()
-            except Exception: pass
-            logger.warning(f"ffprobe stream probing timed out for {url[:80]}")
-        except Exception as e:
-            logger.warning(f"ffprobe stream probe failed ({e}), trying ffmpeg stderr fallback for {url[:80]}")
-            # Fallback: regex on ffmpeg stderr (less reliable on Ubuntu but better than nothing)
+                for stream in probe_data.get("streams", []):
+                    if stream.get("codec_type") == "video":
+                        w = stream.get("width", 0)
+                        h = stream.get("height", 0)
+                        if w and h:
+                            meta["width"] = int(w)
+                            meta["height"] = int(h)
+                        if not meta["duration"]:
+                            s_dur = stream.get("duration", "")
+                            if s_dur and s_dur not in ("", "N/A"):
+                                meta["duration"] = int(float(s_dur))
+                        break
+
+                logger.info(f"ffprobe stream metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
+            except asyncio.TimeoutError:
+                try: probe_proc.kill()
+                except Exception: pass
+                logger.warning(f"ffprobe stream probing timed out for {url[:80]}")
+            except Exception as e:
+                logger.warning(f"ffprobe stream probe failed ({e}), trying ffmpeg stderr fallback")
+                ffprobe = None  # signal to run ffmpeg fallback below
+
+        if not ffprobe or meta["duration"] == 0:
+            # ffprobe unavailable OR returned no duration → use ffmpeg stderr parsing
             try:
                 fb_proc = await asyncio.create_subprocess_exec(
                     _get_ffmpeg(), "-hide_banner", *hdr_args, "-i", url,
@@ -457,8 +469,9 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                 if vid_match:
                     meta['width'] = int(vid_match.group(1))
                     meta['height'] = int(vid_match.group(2))
+                logger.info(f"ffmpeg stderr stream metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
             except Exception as e2:
-                logger.warning(f"ffmpeg stream fallback probe also failed: {e2}")
+                logger.warning(f"ffmpeg stream probe also failed: {e2}")
 
         # 2. Extract middle frame thumbnail
         seek_time = "00:00:01.000"
