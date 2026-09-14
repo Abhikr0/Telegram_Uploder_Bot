@@ -152,18 +152,55 @@ def get_progress_bar(current, total):
     remain = 10 - done
     return f"<code>[{'🟦' * done}{'⬜' * remain}] {percentage:.1%} ({format_bytes(current)} / {format_bytes(total)})</code>"
 
+def get_ffmpeg_cmd() -> str:
+    """
+    Resolve the best available ffmpeg binary.
+    Priority:
+      1. System 'ffmpeg' on PATH  (installed via nixpacks.toml on Railway)
+      2. imageio_ffmpeg bundled binary (fallback for local dev)
+    Logs which binary is being used so Railway logs make it obvious.
+    """
+    # Try system ffmpeg first — fastest & most reliable on Linux/Railway
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3
+        )
+        if result.returncode == 0:
+            logger.info("ffmpeg: using system binary (PATH)")
+            return "ffmpeg"
+    except Exception:
+        pass
+
+    # Fall back to imageio_ffmpeg bundled binary
+    try:
+        import imageio_ffmpeg
+        cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        logger.info(f"ffmpeg: using imageio_ffmpeg binary at {cmd}")
+        return cmd
+    except Exception:
+        pass
+
+    logger.warning("ffmpeg: no binary found! Thumbnails and metadata will be unavailable.")
+    return "ffmpeg"  # last-resort guess
+
+
+# Resolve once at import time and reuse — avoids repeated subprocess probes per upload
+_FFMPEG_CMD: str = ""
+
+def _get_ffmpeg() -> str:
+    global _FFMPEG_CMD
+    if not _FFMPEG_CMD:
+        _FFMPEG_CMD = get_ffmpeg_cmd()
+    return _FFMPEG_CMD
+
+
 def _extract_ffmpeg_metadata(filepath):
     """Extract duration, width, and height using ffmpeg (robust against non-standard MP4 atoms)."""
     meta = {'duration': 0, 'width': 0, 'height': 0}
     try:
-        ffmpeg_cmd = "ffmpeg"
-        try:
-            import imageio_ffmpeg
-            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            pass
         res = subprocess.run(
-            [ffmpeg_cmd, "-hide_banner", "-i", str(filepath)],
+            [_get_ffmpeg(), "-hide_banner", "-i", str(filepath)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -180,7 +217,7 @@ def _extract_ffmpeg_metadata(filepath):
             meta['width'] = int(vid_match.group(1))
             meta['height'] = int(vid_match.group(2))
     except Exception as e:
-        logger.debug(f"ffmpeg metadata extraction failed for {filepath}: {e}")
+        logger.warning(f"ffmpeg metadata extraction failed for {filepath}: {e}")
     return meta
 
 def get_video_metadata(filepath):
@@ -188,6 +225,7 @@ def get_video_metadata(filepath):
     # Attempt ffmpeg first (most reliable on modern MP4/WebM/MKV atoms without parser crashes)
     metadata = _extract_ffmpeg_metadata(filepath)
     if metadata['duration'] > 0 and metadata['width'] > 0:
+        logger.info(f"Metadata extracted: duration={metadata['duration']}s {metadata['width']}x{metadata['height']}")
         return metadata
 
     # Fallback to hachoir if ffmpeg is unavailable or returned incomplete metadata
@@ -204,30 +242,34 @@ def get_video_metadata(filepath):
                     if not metadata['height'] and data.has('height'):
                         metadata['height'] = int(data.get('height'))
     except Exception as e:
-        logger.debug(f"Hachoir fallback failed for {filepath}: {e}")
+        logger.warning(f"Hachoir fallback failed for {filepath}: {e}")
+    logger.info(f"Metadata (hachoir fallback): duration={metadata['duration']}s {metadata['width']}x{metadata['height']}")
     return metadata
 
 
 async def generate_thumbnail(filepath, thumb_path):
-    """Generate a thumbnail for the video using ffmpeg."""
+    """Generate a thumbnail for the video using ffmpeg, scaled to <=320x320 JPEG."""
     try:
-        ffmpeg_cmd = "ffmpeg"
-        try:
-            import imageio_ffmpeg
-            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            pass
         process = await asyncio.create_subprocess_exec(
-            ffmpeg_cmd, '-y', '-i', str(filepath),
-            '-ss', '00:00:01.000', '-vframes', '1',
+            _get_ffmpeg(), '-y',
+            '-ss', '00:00:01.000',
+            '-i', str(filepath),
+            '-vframes', '1',
             '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
             '-q:v', '5',
             str(thumb_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await process.communicate()
-        return thumb_path.exists()
+        _, stderr = await process.communicate()
+        exists = thumb_path.exists()
+        if exists:
+            size_kb = thumb_path.stat().st_size // 1024
+            logger.info(f"Thumbnail generated: {thumb_path.name} ({size_kb} KB)")
+        else:
+            err_out = stderr.decode(errors='replace')[-300:] if stderr else '(no output)'
+            logger.warning(f"Thumbnail NOT generated for {filepath}. ffmpeg stderr: {err_out}")
+        return exists
     except Exception as e:
         logger.warning(f"Thumbnail generation failed for {filepath}: {e}")
         return False
@@ -241,23 +283,16 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
     meta = {'duration': 0, 'width': 0, 'height': 0}
     has_thumb = False
     try:
-        ffmpeg_cmd = "ffmpeg"
-        try:
-            import imageio_ffmpeg
-            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            pass
-
         hdr_args = []
         if headers:
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             hdr_args = ["-headers", headers_str]
 
         thumb_cmd = [
-            ffmpeg_cmd, "-y",
+            _get_ffmpeg(), "-y",
             *hdr_args,
-            "-i", url,
             "-ss", "00:00:01.000",
+            "-i", url,
             "-vframes", "1",
             "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
             "-q:v", "5",
@@ -269,7 +304,7 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
             stderr=asyncio.subprocess.PIPE
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
             output = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
             dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
             if dur_match:
@@ -280,14 +315,19 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                 meta['width'] = int(vid_match.group(1))
                 meta['height'] = int(vid_match.group(2))
             has_thumb = thumb_path.exists()
+            if has_thumb:
+                size_kb = thumb_path.stat().st_size // 1024
+                logger.info(f"Stream thumbnail generated: {thumb_path.name} ({size_kb} KB), meta={meta}")
+            else:
+                logger.warning(f"Stream thumbnail NOT generated. ffmpeg output tail: {output[-300:]}")
         except asyncio.TimeoutError:
             try:
                 proc.kill()
             except Exception:
                 pass
-            logger.debug(f"ffmpeg stream probing timed out for {url[:50]}")
+            logger.warning(f"ffmpeg stream probing timed out for {url[:80]}")
     except Exception as e:
-        logger.debug(f"Stream thumbnail/metadata extraction failed: {e}")
+        logger.warning(f"Stream thumbnail/metadata extraction failed: {e}")
 
     return meta, has_thumb
 
@@ -621,18 +661,11 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         async with httpx.AsyncClient(timeout=15.0) as thumb_client:
                             t_resp = await thumb_client.get(vid["thumbnail"])
                             if t_resp.status_code == 200 and len(t_resp.content) > 1000:
-                                # Re-encode to JPEG ≤320×320 so Telegram accepts it
                                 raw_thumb = thumb_path.with_suffix('.raw_thumb')
                                 raw_thumb.write_bytes(t_resp.content)
                                 try:
-                                    ffmpeg_cmd = "ffmpeg"
-                                    try:
-                                        import imageio_ffmpeg
-                                        ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
-                                    except Exception:
-                                        pass
                                     conv_proc = await asyncio.create_subprocess_exec(
-                                        ffmpeg_cmd, '-y', '-i', str(raw_thumb),
+                                        _get_ffmpeg(), '-y', '-i', str(raw_thumb),
                                         '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
                                         '-q:v', '5', str(thumb_path),
                                         stdout=asyncio.subprocess.PIPE,
@@ -640,10 +673,11 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                     )
                                     await conv_proc.communicate()
                                     has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
+                                    logger.info(f"Fallback thumbnail from URL: has_thumb={has_thumb}")
                                 finally:
                                     raw_thumb.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Fallback thumbnail download/convert failed: {e}")
 
                 attributes = [DocumentAttributeVideo(
                     duration=meta.get('duration', 0),
