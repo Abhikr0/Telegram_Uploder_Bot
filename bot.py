@@ -21,35 +21,6 @@ import hachoir.core.config
 # Silence noisy hachoir parser warnings (e.g. non-standard MP4 atoms)
 hachoir.core.config.quiet = True
 
-# ── FFmpeg binary resolution (cached) ────────────────────────────────────────
-# On Railway (Ubuntu/Nixpacks), system ffmpeg is installed via nixpacks.toml.
-# On Windows dev, we fall back to the imageio-ffmpeg bundled binary.
-
-def _get_ffmpeg_cmd() -> str:
-    """Resolve the ffmpeg binary path once and cache it."""
-    if hasattr(_get_ffmpeg_cmd, '_cached'):
-        return _get_ffmpeg_cmd._cached
-
-    # 1. Try system ffmpeg (available on Railway via nixpacks.toml)
-    cmd = shutil.which("ffmpeg")
-    if cmd:
-        _get_ffmpeg_cmd._cached = cmd
-        return cmd
-
-    # 2. Try imageio-ffmpeg bundled binary (pip-installed, has Linux + Windows builds)
-    try:
-        import imageio_ffmpeg
-        cmd = imageio_ffmpeg.get_ffmpeg_exe()
-        if cmd and os.path.isfile(cmd):
-            _get_ffmpeg_cmd._cached = cmd
-            return cmd
-    except Exception:
-        pass
-
-    # 3. Bare fallback — will fail at runtime if ffmpeg isn't in PATH
-    _get_ffmpeg_cmd._cached = "ffmpeg"
-    return "ffmpeg"
-
 
 
 # Fix Windows console UTF-8 emoji printing
@@ -185,7 +156,12 @@ def _extract_ffmpeg_metadata(filepath):
     """Extract duration, width, and height using ffmpeg (robust against non-standard MP4 atoms)."""
     meta = {'duration': 0, 'width': 0, 'height': 0}
     try:
-        ffmpeg_cmd = _get_ffmpeg_cmd()
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
         res = subprocess.run(
             [ffmpeg_cmd, "-hide_banner", "-i", str(filepath)],
             stdout=subprocess.PIPE,
@@ -235,7 +211,12 @@ def get_video_metadata(filepath):
 async def generate_thumbnail(filepath, thumb_path):
     """Generate a thumbnail for the video using ffmpeg."""
     try:
-        ffmpeg_cmd = _get_ffmpeg_cmd()
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
         process = await asyncio.create_subprocess_exec(
             ffmpeg_cmd, '-y', '-i', str(filepath),
             '-ss', '00:00:01.000', '-vframes', '1',
@@ -260,7 +241,12 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
     meta = {'duration': 0, 'width': 0, 'height': 0}
     has_thumb = False
     try:
-        ffmpeg_cmd = _get_ffmpeg_cmd()
+        ffmpeg_cmd = "ffmpeg"
+        try:
+            import imageio_ffmpeg
+            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
 
         hdr_args = []
         if headers:
@@ -639,7 +625,12 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 raw_thumb = thumb_path.with_suffix('.raw_thumb')
                                 raw_thumb.write_bytes(t_resp.content)
                                 try:
-                                    ffmpeg_cmd = _get_ffmpeg_cmd()
+                                    ffmpeg_cmd = "ffmpeg"
+                                    try:
+                                        import imageio_ffmpeg
+                                        ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+                                    except Exception:
+                                        pass
                                     conv_proc = await asyncio.create_subprocess_exec(
                                         ffmpeg_cmd, '-y', '-i', str(raw_thumb),
                                         '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
@@ -1424,8 +1415,6 @@ async def set_bot_commands():
 
 async def main():
     print("🚀 Starting Bot...")
-    ffmpeg_resolved = _get_ffmpeg_cmd()
-    logger.info(f"FFmpeg binary resolved: {ffmpeg_resolved}")
     await client.start(bot_token=BOT_TOKEN)
     print("✅ Setting commands...")
     await set_bot_commands()
