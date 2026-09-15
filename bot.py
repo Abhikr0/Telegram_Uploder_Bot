@@ -295,8 +295,9 @@ def _extract_ffmpeg_metadata(filepath):
         if dur_match:
             h, m, s = dur_match.groups()
             meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
-        # Anchored regex: match WxH only inside a Video stream line to avoid false positives
-        vid_match = re.search(r'Stream[^\n]*Video:[^\n]*(\d{2,5})x(\d{2,5})', output)
+        # Anchored regex: match WxH only inside a Video stream line to avoid false positives.
+        # Non-greedy .*? and \b ensures full width digits are captured (e.g. 320x568 not 20x568).
+        vid_match = re.search(r'Stream[^\n]*Video:.*?\b(\d{2,5})x(\d{2,5})\b', output)
         if vid_match:
             meta['width'] = int(vid_match.group(1))
             meta['height'] = int(vid_match.group(2))
@@ -331,7 +332,7 @@ def get_video_metadata(filepath):
     return metadata
 
 
-async def generate_thumbnail(filepath, thumb_path, duration=0):
+async def generate_thumbnail(filepath, thumb_path, duration=0, seek_time: str | None = None):
     """
     Generate a thumbnail for the video using ffmpeg, scaled to <=320x320 JPEG.
 
@@ -339,12 +340,16 @@ async def generate_thumbnail(filepath, thumb_path, duration=0):
       - Seek AFTER -i (output seek) for accurate frame extraction on any container.
       - Explicit -vcodec mjpeg + -f image2 so Ubuntu ffmpeg always writes a valid JPEG.
       - Pad filter ensures even pixel dimensions (avoids encoder failures on odd sizes).
+      - Auto-fallback: if initial seek lands past EOF (e.g. in a partial chunk),
+        automatically retries with seek 00:00:00.000 to capture the first available frame.
       - asyncio.wait_for timeout prevents indefinite hangs on slow/corrupt files.
     """
-    seek_time = "00:00:01.000"
-    if duration > 2:
-        mid = int(duration) // 2
-        seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
+    if seek_time is None:
+        if duration > 2:
+            mid = int(duration) // 2
+            seek_time = f"{mid//3600:02d}:{(mid%3600)//60:02d}:{mid%60:02d}.000"
+        else:
+            seek_time = "00:00:00.500"
 
     # scale=w:h:force_original_aspect_ratio=decrease keeps aspect ratio,
     # pad=320:320:(ow-iw)/2:(oh-ih)/2 pads to exact 320x320 with black bars (avoids odd-dimension crash),
@@ -355,35 +360,48 @@ async def generate_thumbnail(filepath, thumb_path, duration=0):
         "format=yuvj420p"
     )
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            _get_ffmpeg(), '-hide_banner', '-y',
-            '-i', str(filepath),      # <-- -i FIRST
-            '-ss', seek_time,          # <-- -ss AFTER -i = output seek (accurate on all Linux containers)
-            '-vframes', '1',
-            '-vf', vf,
-            '-vcodec', 'mjpeg',        # explicit JPEG encoder (required on some Ubuntu builds)
-            '-q:v', '3',               # quality 3 (1–31, lower=better); 5 was sometimes too low
-            str(thumb_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+    async def _try_extract(seek_pos: str) -> tuple[bool, str]:
         try:
-            _, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
-        except asyncio.TimeoutError:
-            try: process.kill()
-            except Exception: pass
-            logger.warning(f"Thumbnail generation timed out for {filepath}")
-            return False
+            process = await asyncio.create_subprocess_exec(
+                _get_ffmpeg(), '-hide_banner', '-y',
+                '-i', str(filepath),      # <-- -i FIRST
+                '-ss', seek_pos,           # <-- -ss AFTER -i = output seek (accurate on all Linux containers)
+                '-vframes', '1',
+                '-vf', vf,
+                '-vcodec', 'mjpeg',        # explicit JPEG encoder (required on some Ubuntu builds)
+                '-q:v', '3',               # quality 3 (1–31, lower=better); 5 was sometimes too low
+                str(thumb_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                _, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
+            except asyncio.TimeoutError:
+                try: process.kill()
+                except Exception: pass
+                return False, "timeout"
 
-        exists = thumb_path.exists() and thumb_path.stat().st_size > 0
-        if exists:
+            exists = thumb_path.exists() and thumb_path.stat().st_size > 0
+            err_out = stderr.decode(errors='replace')[-1000:] if stderr else '(no output)'
+            return exists, err_out
+        except Exception as e:
+            return False, str(e)
+
+    try:
+        ok, err = await _try_extract(seek_time)
+        if not ok and seek_time != "00:00:00.000":
+            # Partial file or seek past EOF — retry at first keyframe
+            name_label = filepath.name if hasattr(filepath, 'name') else filepath
+            logger.info(f"Thumbnail seek to {seek_time} yielded no frame for {name_label}. Retrying at 00:00:00.000...")
+            ok, err = await _try_extract("00:00:00.000")
+
+        if ok:
             size_kb = thumb_path.stat().st_size // 1024
             logger.info(f"Thumbnail generated: {thumb_path.name} ({size_kb} KB)")
+            return True
         else:
-            err_out = stderr.decode(errors='replace')[-1000:] if stderr else '(no output)'
-            logger.warning(f"Thumbnail NOT generated for {filepath}. ffmpeg stderr: {err_out}")
-        return exists
+            logger.warning(f"Thumbnail NOT generated for {filepath}. ffmpeg stderr: {err}")
+            return False
     except Exception as e:
         logger.warning(f"Thumbnail generation failed for {filepath}: {e}")
         return False
@@ -470,7 +488,7 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                 if dur_m:
                     h2, m2, s2 = dur_m.groups()
                     meta['duration'] = int(int(h2) * 3600 + int(m2) * 60 + float(s2))
-                vid_m = re.search(r'Stream[^\n]*Video:[^\n]*(\d{2,5})x(\d{2,5})', output)
+                vid_m = re.search(r'Stream[^\n]*Video:.*?\b(\d{2,5})x(\d{2,5})\b', output)
                 if vid_m:
                     meta['width'], meta['height'] = int(vid_m.group(1)), int(vid_m.group(2))
                 if meta['duration'] > 0:
@@ -531,12 +549,12 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                     logger.info(f"Downloaded partial chunk: {len(resp.content)//1024} KB → {partial_path.name}")
 
                     # Probe the local chunk for metadata
-                    if meta['duration'] == 0:
+                    if meta['duration'] == 0 or meta['width'] == 0:
                         chunk_meta = get_video_metadata(partial_path)
                         if chunk_meta['width'] > 0:
                             meta['width'] = chunk_meta['width']
                             meta['height'] = chunk_meta['height']
-                        if chunk_meta['duration'] > 0:
+                        if chunk_meta['duration'] > 0 and meta['duration'] == 0:
                             meta['duration'] = chunk_meta['duration']
                         logger.info(f"Chunk metadata: duration={meta['duration']}s {meta['width']}x{meta['height']}")
 
@@ -544,7 +562,7 @@ async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_
                     if not has_thumb:
                         has_thumb = await generate_thumbnail(
                             partial_path, thumb_path,
-                            duration=meta.get('duration', 0)
+                            seek_time="00:00:00.500"
                         )
                         if has_thumb:
                             logger.info(f"Thumbnail from partial chunk: {thumb_path.name} ({thumb_path.stat().st_size//1024} KB)")
