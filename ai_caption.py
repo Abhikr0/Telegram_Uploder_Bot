@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import html
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 import httpx
 
@@ -16,6 +17,17 @@ def _escape(text: str) -> str:
     if not text:
         return ""
     return html.escape(str(text), quote=False)
+
+def sanitize_filename(name: str, ext: str = ".mp4") -> str:
+    """Sanitize string into a safe file name with correct extension."""
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(name))
+    clean = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" ._")
+    if not clean:
+        clean = "video"
+    if not clean.lower().endswith(ext.lower()):
+        clean = f"{clean}{ext}"
+    return clean[:80]
 
 def _sanitize_hashtag(tag: str) -> str:
     """Sanitize a string into a valid Telegram hashtag."""
@@ -101,8 +113,14 @@ def _build_fallback_caption(raw_title: str, content: str, service: str, creator:
     rich_caption = "\n\n".join(caption_parts)
     db_title = f"{clean_title[:90]} {' '.join(tags)}"
 
+    ext = Path(raw_title).suffix.lower()
+    if ext not in {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts"}:
+        ext = ".mp4"
+    file_name = sanitize_filename(clean_title, ext)
+
     return {
         "clean_title": clean_title[:100],
+        "file_name": file_name,
         "summary": content[:140] if content else "",
         "hashtags": tags,
         "rich_caption": rich_caption,
@@ -139,12 +157,13 @@ async def generate_ai_caption(vid: Dict[str, Any], service: str, creator: str) -
         "Rules:\n"
         "1. 'clean_title': Catchy, natural, descriptive title (maximum 80 characters). "
         "Remove raw random hashes, UUIDs, underscores, and file extensions like .mp4/.mkv.\n"
-        "2. 'summary': 1-2 sentence compelling overview of the video/post (maximum 150 characters). "
+        "2. 'file_name': Clean, descriptive filename ending with the original video extension (.mp4/.mkv, maximum 60 characters).\n"
+        "3. 'summary': 1-2 sentence compelling overview of the video/post (maximum 150 characters). "
         "Do not include URLs or spam.\n"
-        "3. 'hashtags': 5 to 8 searchable hashtags starting with '#'. Include platform, creator name, "
+        "4. 'hashtags': 5 to 8 searchable hashtags starting with '#'. Include platform, creator name, "
         "content format, and relevant keywords in CamelCase (e.g., #OnlyFans, #CreatorName, #Exclusive, #Vlog, #1080p).\n"
         "Output ONLY valid JSON matching this schema:\n"
-        '{"clean_title": "...", "summary": "...", "hashtags": ["#...", "#..."]}'
+        '{"clean_title": "...", "file_name": "...", "summary": "...", "hashtags": ["#...", "#..."]}'
     )
 
     try:
@@ -177,6 +196,12 @@ async def generate_ai_caption(vid: Dict[str, Any], service: str, creator: str) -
         clean_title = (parsed.get("clean_title") or fallback["clean_title"]).strip()
         summary = (parsed.get("summary") or fallback["summary"]).strip()
         raw_hashtags = parsed.get("hashtags") or fallback["hashtags"]
+
+        ext = Path(raw_title).suffix.lower()
+        if ext not in {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".ts"}:
+            ext = ".mp4"
+        raw_file_name = parsed.get("file_name")
+        file_name = sanitize_filename(raw_file_name, ext) if raw_file_name else sanitize_filename(clean_title, ext)
 
         # Ensure valid hashtags
         hashtags: List[str] = []
@@ -220,6 +245,7 @@ async def generate_ai_caption(vid: Dict[str, Any], service: str, creator: str) -
         logger.info(f"Generated AI metadata for '{clean_title}' with {len(hashtags)} hashtags.")
         return {
             "clean_title": clean_title[:100],
+            "file_name": file_name,
             "summary": summary,
             "hashtags": hashtags,
             "rich_caption": rich_caption,
@@ -229,3 +255,8 @@ async def generate_ai_caption(vid: Dict[str, Any], service: str, creator: str) -
     except Exception as e:
         logger.warning(f"Error calling Mistral AI for metadata: {e}. Falling back to default caption.")
         return fallback
+
+async def generate_ai_name(raw_title: str, service: str = "", creator: str = "") -> str:
+    """Generate clean video filename using Mistral AI with fallback."""
+    meta = await generate_ai_caption({"title": raw_title}, service, creator)
+    return meta.get("file_name") or sanitize_filename(raw_title)

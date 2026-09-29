@@ -128,23 +128,23 @@ def parse_page_range(pages_str: str) -> tuple[int, int] | None:
     """Parse page range string like '1-5' or '3'."""
     if not pages_str:
         return None
-    pages_str = pages_str.strip()
+    pages_str = str(pages_str).strip()
     if "-" in pages_str:
         try:
             start, end = map(int, pages_str.split("-", 1))
-            if start < 1 or end < start: raise ValueError
+            if start < 1 or end < start:
+                return None
             return start, end
         except ValueError:
-            print(f"❌ Invalid range: {pages_str}. Use '1-5'.")
-            sys.exit(1)
+            return None
     else:
         try:
             p = int(pages_str)
-            if p < 1: raise ValueError
+            if p < 1:
+                return None
             return p, p
         except ValueError:
-            print(f"❌ Invalid page: {pages_str}.")
-            sys.exit(1)
+            return None
 
 # ── Crawler & API Fetching ───────────────────────────────────────────────────
 

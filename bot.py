@@ -5,25 +5,37 @@ import logging
 import shutil
 import time
 import uuid
+import subprocess
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, Button, functions, types, errors
-from telethon.tl.types import DocumentAttributeVideo, BotCommand, BotCommandScopeDefault
+import httpx
+from telethon import TelegramClient, events, Button, functions, errors
+from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename, BotCommand, BotCommandScopeDefault
 from tqdm import tqdm
-
-import subprocess
-import re
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 import hachoir.core.config
+from fasttelethon import upload_file, upload_http_stream
+from ai_caption import generate_ai_caption, generate_ai_name
+from scraper import (
+    parse_media_url,
+    parse_page_range,
+    fetch_all_posts,
+    extract_video_urls,
+    download_video,
+    resolve_media_stream_info
+)
 
-# Silence noisy hachoir parser warnings (e.g. non-standard MP4 atoms)
 hachoir.core.config.quiet = True
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+for noisy in ("telethon", "asyncio", "httpx"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+logging.getLogger("hachoir").setLevel(logging.ERROR)
+_IS_TTY: bool = sys.stderr.isatty()
 
-
-
-# Fix Windows console UTF-8 emoji printing
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -31,40 +43,18 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Import fasttelethon from local file
-from fasttelethon import upload_file, upload_http_stream
-
-# Import AI caption & metadata generator
-from ai_caption import generate_ai_caption
-
-import httpx
-
-# Import scraper functions
-from scraper import (
-    parse_media_url,
-    parse_profile_url, 
-    parse_page_range, 
-    fetch_all_posts, 
-    extract_video_urls, 
-    download_video,
-    resolve_media_stream_info
-)
-
-# ── Configuration ────────────────────────────────────────────────────────────
-
 load_dotenv()
-
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", 0))
-ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "bot_downloads")
 ENABLE_STREAM_UPLOAD = os.getenv("ENABLE_STREAM_UPLOAD", "true").lower() in ("true", "1", "yes")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-# Initialize optional Supabase client for auto-indexing
 supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -74,37 +64,45 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         logging.warning(f"Could not connect to Supabase: {e}")
 
-# Ensure download directory exists
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 MAX_UPLOAD_RETRIES = 3
 RETRY_DELAY = 5
-
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-# Initialize Telethon Client
 client = TelegramClient("uploader_bot_session", API_ID, API_HASH)
 
-# State management for interactive flow
-USER_STATES = {}
-RUNNING_TASKS = {}
-LAST_TASK_INFO = {}
+class BoundedDict(dict):
+    def __init__(self, maxsize=500):
+        super().__init__()
+        self.maxsize = maxsize
+    def __setitem__(self, k, v):
+        if len(self) >= self.maxsize and k not in self:
+            self.pop(next(iter(self)))
+        super().__setitem__(k, v)
+
+USER_STATES = BoundedDict(500)
+RUNNING_TASKS = BoundedDict(500)
+LAST_TASK_INFO = BoundedDict(500)
 
 class BarPositionManager:
     def __init__(self, max_bars=6):
         self.max_bars = max_bars
         self.occupied = [False] * max_bars
-        self.lock = asyncio.Lock()
+        self._lock = None
+
+    @property
+    def lock(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def get_pos(self):
-        async with self.lock:
-            for i in range(self.max_bars):
-                if not self.occupied[i]:
-                    self.occupied[i] = True
-                    return i + 1  # Offset by 1 for overall progress
-            return 0
+        for _ in range(50):
+            async with self.lock:
+                for i in range(self.max_bars):
+                    if not self.occupied[i]:
+                        self.occupied[i] = True
+                        return i + 1
+            await asyncio.sleep(0.1)
+        return 0
 
     async def release_pos(self, pos):
         if pos <= 0: return
@@ -152,139 +150,168 @@ def get_progress_bar(current, total):
     remain = 10 - done
     return f"<code>[{'🟦' * done}{'⬜' * remain}] {percentage:.1%} ({format_bytes(current)} / {format_bytes(total)})</code>"
 
-def _extract_ffmpeg_metadata(filepath):
-    """Extract duration, width, and height using ffmpeg (robust against non-standard MP4 atoms)."""
-    meta = {'duration': 0, 'width': 0, 'height': 0}
-    try:
-        ffmpeg_cmd = "ffmpeg"
+_FFMPEG: str | None = None
+_FFPROBE: str | None = None
+
+def _get_ffmpeg() -> str:
+    global _FFMPEG
+    if _FFMPEG is None:
         try:
             import imageio_ffmpeg
-            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+            _FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:
-            pass
-        res = subprocess.run(
-            [ffmpeg_cmd, "-hide_banner", "-i", str(filepath)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=8,
-            errors="replace"
-        )
-        output = (res.stderr or "") + " " + (res.stdout or "")
-        dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
-        if dur_match:
-            h, m, s = dur_match.groups()
-            meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
-        vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
-        if vid_match:
-            meta['width'] = int(vid_match.group(1))
-            meta['height'] = int(vid_match.group(2))
-    except Exception as e:
-        logger.debug(f"ffmpeg metadata extraction failed for {filepath}: {e}")
-    return meta
+            _FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+    return _FFMPEG
+
+def _get_ffprobe() -> str | None:
+    global _FFPROBE
+    if _FFPROBE is None:
+        _FFPROBE = shutil.which("ffprobe")
+    return _FFPROBE
 
 def get_video_metadata(filepath):
-    """Extract duration, width, and height from video file with ffmpeg and hachoir fallback."""
-    # Attempt ffmpeg first (most reliable on modern MP4/WebM/MKV atoms without parser crashes)
-    metadata = _extract_ffmpeg_metadata(filepath)
-    if metadata['duration'] > 0 and metadata['width'] > 0:
-        return metadata
-
-    # Fallback to hachoir if ffmpeg is unavailable or returned incomplete metadata
-    try:
-        parser = createParser(str(filepath))
-        if parser:
-            with parser:
-                data = extractMetadata(parser)
-                if data:
-                    if not metadata['duration'] and data.has('duration'):
-                        metadata['duration'] = int(data.get('duration').seconds)
-                    if not metadata['width'] and data.has('width'):
-                        metadata['width'] = int(data.get('width'))
-                    if not metadata['height'] and data.has('height'):
-                        metadata['height'] = int(data.get('height'))
-    except Exception as e:
-        logger.debug(f"Hachoir fallback failed for {filepath}: {e}")
-    return metadata
-
-
-async def generate_thumbnail(filepath, thumb_path):
-    """Generate a thumbnail for the video using ffmpeg."""
-    try:
-        ffmpeg_cmd = "ffmpeg"
+    meta = {'duration': 0, 'width': 0, 'height': 0}
+    ffprobe = _get_ffprobe()
+    if ffprobe:
         try:
-            import imageio_ffmpeg
-            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
+            res = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,duration:format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(filepath)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+            )
+            lines = [x.strip() for x in res.stdout.strip().splitlines() if x.strip()]
+            for val in lines:
+                try:
+                    fval = float(val)
+                    if '.' in val or meta['duration'] == 0:
+                        meta['duration'] = int(fval)
+                except ValueError:
+                    pass
+            if len(lines) >= 2:
+                try:
+                    meta['width'], meta['height'] = int(lines[0]), int(lines[1])
+                except ValueError:
+                    pass
         except Exception:
             pass
-        process = await asyncio.create_subprocess_exec(
-            ffmpeg_cmd, '-y', '-i', str(filepath),
-            '-ss', '00:00:01.000', '-vframes', '1',
-            str(thumb_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
-        return thumb_path.exists()
-    except Exception as e:
-        logger.warning(f"Thumbnail generation failed for {filepath}: {e}")
-        return False
+    if not meta['duration'] or not meta['width']:
+        try:
+            res = subprocess.run(
+                [_get_ffmpeg(), "-hide_banner", "-i", str(filepath)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8, errors="replace"
+            )
+            out = (res.stderr or "") + " " + (res.stdout or "")
+            m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', out)
+            if m:
+                meta['duration'] = int(int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]))
+            vm = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', out)
+            if vm:
+                meta['width'], meta['height'] = int(vm[1]), int(vm[2])
+        except Exception:
+            pass
+    if not meta['duration'] or not meta['width']:
+        try:
+            parser = createParser(str(filepath))
+            if parser:
+                with parser:
+                    data = extractMetadata(parser)
+                    if data:
+                        if not meta['duration'] and data.has('duration'):
+                            meta['duration'] = int(data.get('duration').seconds)
+                        if not meta['width'] and data.has('width'):
+                            meta['width'] = int(data.get('width'))
+                        if not meta['height'] and data.has('height'):
+                            meta['height'] = int(data.get('height'))
+        except Exception:
+            pass
+    return meta
 
+async def generate_thumbnail(filepath, thumb_path, duration=0):
+    seek = f"00:00:{max(1, duration // 2):02d}.000" if duration > 2 else "00:00:01.000"
+    for ss in (seek, "00:00:00.000"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _get_ffmpeg(), '-y', '-ss', ss, '-i', str(filepath),
+                '-vframes', '1', '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
+                '-q:v', '2', str(thumb_path),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+            if thumb_path.exists() and thumb_path.stat().st_size > 0:
+                return True
+        except Exception:
+            pass
+    return False
 
-async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_path: Path) -> tuple[dict, bool]:
-    """
-    Extracts video metadata (duration, width, height) and generates a thumbnail
-    directly from an HTTP URL using imageio_ffmpeg in 1-2 seconds without downloading the whole file.
-    """
+async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_path: Path, file_size: int = 0) -> tuple[dict, bool]:
     meta = {'duration': 0, 'width': 0, 'height': 0}
     has_thumb = False
+    hdr_args = []
+    if headers:
+        hdr_args = ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+
     try:
-        ffmpeg_cmd = "ffmpeg"
-        try:
-            import imageio_ffmpeg
-            ffmpeg_cmd = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            pass
-
-        hdr_args = []
-        if headers:
-            headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-            hdr_args = ["-headers", headers_str]
-
-        thumb_cmd = [
-            ffmpeg_cmd, "-y",
-            *hdr_args,
-            "-ss", "00:00:01.000",
-            "-i", url,
-            "-vframes", "1",
-            "-q:v", "2",
-            str(thumb_path)
-        ]
         proc = await asyncio.create_subprocess_exec(
-            *thumb_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            _get_ffmpeg(), "-y", *hdr_args,
+            "-ss", "00:00:01.000", "-i", url,
+            "-vframes", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+            "-q:v", "2", str(thumb_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
-            output = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
-            dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', output)
-            if dur_match:
-                h, m, s = dur_match.groups()
-                meta['duration'] = int(int(h) * 3600 + int(m) * 60 + float(s))
-            vid_match = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', output)
-            if vid_match:
-                meta['width'] = int(vid_match.group(1))
-                meta['height'] = int(vid_match.group(2))
-            has_thumb = thumb_path.exists()
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+            out = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
+            m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', out)
+            if m:
+                meta['duration'] = int(int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]))
+            vm = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', out)
+            if vm:
+                meta['width'], meta['height'] = int(vm[1]), int(vm[2])
+            has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            logger.debug(f"ffmpeg stream probing timed out for {url[:50]}")
-    except Exception as e:
-        logger.debug(f"Stream thumbnail/metadata extraction failed: {e}")
+            proc.kill()
+    except Exception:
+        pass
+
+    if not has_thumb or meta['duration'] == 0:
+        chunk_path = thumb_path.with_suffix('.part.mp4')
+        try:
+            chunk_headers = dict(headers or {})
+            chunk_headers["Range"] = "bytes=0-16777215"
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as hclient:
+                r = await hclient.get(url, headers=chunk_headers)
+                if r.status_code in (200, 206) and len(r.content) > 1024:
+                    chunk_path.write_bytes(r.content)
+                    if not has_thumb:
+                        has_thumb = await generate_thumbnail(chunk_path, thumb_path, duration=0)
+                    if meta['duration'] == 0:
+                        part_meta = get_video_metadata(chunk_path)
+                        if part_meta['duration'] > 0:
+                            meta['duration'] = part_meta['duration']
+                        if not meta['width']:
+                            meta['width'], meta['height'] = part_meta['width'], part_meta['height']
+
+                    if meta['duration'] == 0 and file_size > 18000000:
+                        tail_headers = dict(headers or {})
+                        tail_headers["Range"] = f"bytes={file_size - 2097152}-{file_size - 1}"
+                        tr = await hclient.get(url, headers=tail_headers)
+                        if tr.status_code in (200, 206) and len(tr.content) > 1024:
+                            tail_path = thumb_path.with_suffix('.tail.mp4')
+                            try:
+                                tail_path.write_bytes(tr.content)
+                                tail_meta = get_video_metadata(tail_path)
+                                if tail_meta['duration'] > 0:
+                                    meta['duration'] = tail_meta['duration']
+                            finally:
+                                if tail_path.exists(): tail_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        finally:
+            if chunk_path.exists(): chunk_path.unlink(missing_ok=True)
 
     return meta, has_thumb
 
@@ -469,6 +496,9 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
         # Pipeline worker definitions
         async def disk_pipeline_worker(vid, pos=None):
+            vid = dict(vid)
+            if 'name' not in vid or not vid['name'].lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v')):
+                vid['name'] = (vid.get('name') or 'video') + '.mp4'
             need_release = False
             if pos is None:
                 pos = await BAR_MANAGER.get_pos()
@@ -511,25 +541,34 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         last_pbar_time[0] = time.time()
 
                 metadata = get_video_metadata(filepath)
-                thumb_path = filepath.with_suffix('.jpg')
-                has_thumb = await generate_thumbnail(filepath, thumb_path)
-                attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
+                thumb_path = filepath.with_name(f"{filepath.stem}_{uuid.uuid4().hex[:8]}.jpg")
+                has_thumb = await generate_thumbnail(filepath, thumb_path, duration=metadata.get('duration', 0))
 
-                # Prepare rich caption & metadata (via Mistral AI)
                 ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                 rich_caption = ai_meta["rich_caption"]
                 db_title = ai_meta["db_title"]
+                clean_name = ai_meta.get("file_name") or vid['name']
+
+                attributes = [
+                    DocumentAttributeVideo(
+                        duration=metadata.get('duration', 0),
+                        w=metadata.get('width') or (320 if has_thumb else 0),
+                        h=metadata.get('height') or (320 if has_thumb else 0),
+                        supports_streaming=True
+                    ),
+                    DocumentAttributeFilename(file_name=clean_name)
+                ]
 
                 sent_msg = None
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
                     try:
-                        with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [UP] {vid['name'][:20]}", position=pos, leave=False) as t_pbar:
+                        with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [UP] {vid['name'][:20]}", position=pos, leave=False, disable=not _IS_TTY) as t_pbar:
                             async def upload_progress(current, total):
                                 await progress_callback(current, total)
                                 t_pbar.n = current
                                 t_pbar.refresh()
                             with open(filepath, "rb") as f:
-                                uploaded_file = await upload_file(client, f, progress_callback=upload_progress)
+                                uploaded_file = await upload_file(client, f, progress_callback=upload_progress, file_name=clean_name)
                             sent_msg = await client.send_file(
                                 target_channel_id,
                                 uploaded_file,
@@ -538,6 +577,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 supports_streaming=True,
                                 attributes=attributes,
                                 thumb=str(thumb_path) if has_thumb else None,
+                                file_name=clean_name,
                                 video=True
                             )
                         break
@@ -580,6 +620,9 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     await BAR_MANAGER.release_pos(pos)
 
         async def stream_pipeline_worker(vid):
+            vid = dict(vid)
+            if 'name' not in vid or not vid['name'].lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v')):
+                vid['name'] = (vid.get('name') or 'video') + '.mp4'
             pos = await BAR_MANAGER.get_pos()
             vid_name = vid.get('name') or vid.get('title') or "video"
             state["active_uploads"][vid_name] = "<code>[Connecting Stream...] ⏳</code>"
@@ -610,8 +653,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 stream_filename = info.get("name") or f"{vid['id']}_{vid_name}"
 
                 state["active_uploads"][vid_name] = "<code>[Probing Stream...] ⚙️</code>"
-                thumb_path = temp_dir / f"{vid['id']}_thumb.jpg"
-                meta, has_thumb = await generate_stream_thumbnail_and_metadata(stream_url, stream_headers, thumb_path)
+                thumb_path = temp_dir / f"{vid['id']}_{uuid.uuid4().hex[:8]}_thumb.jpg"
+                meta, has_thumb = await generate_stream_thumbnail_and_metadata(stream_url, stream_headers, thumb_path, file_size=file_size)
 
                 if not has_thumb and vid.get("thumbnail"):
                     try:
@@ -623,23 +666,27 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     except Exception:
                         pass
 
-                attributes = [DocumentAttributeVideo(
-                    duration=meta.get('duration', 0),
-                    w=meta.get('width', 0),
-                    h=meta.get('height', 0),
-                    supports_streaming=True
-                )]
-
                 ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                 rich_caption = ai_meta["rich_caption"]
                 db_title = ai_meta["db_title"]
+                clean_name = ai_meta.get("file_name") or stream_filename
+
+                attributes = [
+                    DocumentAttributeVideo(
+                        duration=meta.get('duration', 0),
+                        w=meta.get('width') or (320 if has_thumb else 0),
+                        h=meta.get('height') or (320 if has_thumb else 0),
+                        supports_streaming=True
+                    ),
+                    DocumentAttributeFilename(file_name=clean_name)
+                ]
 
                 state["active_uploads"][vid_name] = "<code>[Streaming to Telegram...] 🚀</code>"
 
                 sent_msg = None
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
                     try:
-                        with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [STREAM] {vid_name[:20]}", position=pos, leave=False) as t_pbar:
+                        with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [STREAM] {vid_name[:20]}", position=pos, leave=False, disable=not _IS_TTY) as t_pbar:
                             async def upload_progress(current, total):
                                 await progress_callback(current, total)
                                 t_pbar.n = current
@@ -648,7 +695,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                             uploaded_file, _ = await upload_http_stream(
                                 client=client,
                                 url=stream_url,
-                                file_name=stream_filename,
+                                file_name=clean_name,
                                 headers=stream_headers,
                                 progress_callback=upload_progress
                             )
@@ -660,6 +707,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 supports_streaming=True,
                                 attributes=attributes,
                                 thumb=str(thumb_path) if has_thumb else None,
+                                file_name=clean_name,
                                 video=True
                             )
                         break
@@ -749,6 +797,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         break
 
                     vid, filepath = item
+                    vid = dict(vid)
                     pos = await BAR_MANAGER.get_pos()
                     try:
                         file_size = filepath.stat().st_size
@@ -761,24 +810,33 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 last_pbar_time[0] = time.time()
 
                         metadata = get_video_metadata(filepath)
-                        thumb_path = filepath.with_suffix('.jpg')
-                        has_thumb = await generate_thumbnail(filepath, thumb_path)
-                        attributes = [DocumentAttributeVideo(duration=metadata['duration'], w=metadata['width'], h=metadata['height'], supports_streaming=True)]
-
+                        thumb_path = filepath.with_name(f"{filepath.stem}_{uuid.uuid4().hex[:8]}.jpg")
+                        has_thumb = await generate_thumbnail(filepath, thumb_path, duration=metadata.get('duration', 0))
                         ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                         rich_caption = ai_meta["rich_caption"]
                         db_title = ai_meta["db_title"]
+                        clean_name = ai_meta.get("file_name") or vid['name']
+
+                        attributes = [
+                            DocumentAttributeVideo(
+                                duration=metadata.get('duration', 0),
+                                w=metadata.get('width') or (320 if has_thumb else 0),
+                                h=metadata.get('height') or (320 if has_thumb else 0),
+                                supports_streaming=True
+                            ),
+                            DocumentAttributeFilename(file_name=clean_name)
+                        ]
 
                         sent_msg = None
                         for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
                             try:
-                                with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [UP] {vid['name'][:20]}", position=pos, leave=False) as t_pbar:
+                                with tqdm(total=file_size, unit="B", unit_scale=True, desc=f"   [UP] {vid['name'][:20]}", position=pos, leave=False, disable=not _IS_TTY) as t_pbar:
                                     async def upload_progress(current, total):
                                         await progress_callback(current, total)
                                         t_pbar.n = current
                                         t_pbar.refresh()
                                     with open(filepath, "rb") as f:
-                                        uploaded_file = await upload_file(client, f, progress_callback=upload_progress)
+                                        uploaded_file = await upload_file(client, f, progress_callback=upload_progress, file_name=clean_name)
                                     sent_msg = await client.send_file(
                                         target_channel_id,
                                         uploaded_file,
@@ -787,6 +845,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                         supports_streaming=True,
                                         attributes=attributes,
                                         thumb=str(thumb_path) if has_thumb else None,
+                                        file_name=clean_name,
                                         video=True
                                     )
                                 break
@@ -841,6 +900,10 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
         state["running"] = False
         if status_task:
             status_task.cancel()
+            try:
+                await status_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         final_text = (
             f"🏁 <b>Task Completed!</b>\n"
@@ -908,7 +971,7 @@ async def start_handler(event):
         f"• <b>Active Tasks:</b> <code>{active_count}</code>\n"
         f"• <b>Temp Cache:</b> <code>{temp_size_mb} MB</code>\n"
         f"• <b>Supabase Auto-Index:</b> {'🟢 Enabled' if supabase_client else '⚪ Disabled'}\n"
-        f"• <b>Mistral AI Metadata:</b> ⚡ Active\n"
+        f"• <b>Mistral AI:</b> {'⚡ Active' if MISTRAL_API_KEY else '⚪ Disabled'}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "🚀 <b>Quick Start:</b>\n"
         "Simply <b>paste any URL directly into this chat</b>, or click <b>New Download</b> below."
@@ -969,6 +1032,9 @@ async def callback_handler(event):
         await event.answer("Cancelled", alert=False)
         
     elif data == "clear_temp":
+        if RUNNING_TASKS:
+            await event.answer("⚠️ Active tasks are running. Cancel them first.", alert=True)
+            return
         if os.path.exists(DOWNLOAD_DIR):
             shutil.rmtree(DOWNLOAD_DIR)
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -992,7 +1058,7 @@ async def callback_handler(event):
             f"• <b>Indexed Supabase Videos:</b> <code>{total_idx}</code>\n"
             f"• <b>Temp Download Dir:</b> <code>{DOWNLOAD_DIR}</code>\n"
             f"• <b>Upload Pipeline:</b> Sequential MTProto Queue\n"
-            f"• <b>AI Tagging:</b> Mistral AI\n"
+            f"• <b>Mistral AI:</b> {'⚡ Active' if MISTRAL_API_KEY else '⚪ Disabled'}\n"
             f"• <b>Service Health:</b> 🟢 100% Operational\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -1375,6 +1441,45 @@ async def bunkr_command_handler(event):
         return
     asyncio.create_task(download_and_upload(event, url, page_range, STORAGE_CHANNEL_ID))
 
+@client.on(events.NewMessage(pattern=r"^/stats$"))
+async def stats_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    total_idx = "N/A"
+    if supabase_client:
+        try:
+            res = await asyncio.to_thread(lambda: supabase_client.table("media").select("id", count="exact").execute())
+            total_idx = str(res.count or 0)
+        except Exception:
+            pass
+    stat_text = (
+        "📊 <b>Uploader & Storage Overview</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Active Tasks:</b> <code>{len(RUNNING_TASKS)}</code>\n"
+        f"• <b>Storage Channel:</b> <code>{STORAGE_CHANNEL_ID}</code>\n"
+        f"• <b>Indexed Videos:</b> <code>{total_idx}</code>\n"
+        f"• <b>Mistral AI:</b> {'⚡ Active' if MISTRAL_API_KEY else '⚪ Disabled'}\n"
+        f"• <b>Stream Mode:</b> {'⚡ Zero-Disk Streaming' if ENABLE_STREAM_UPLOAD else '💾 Disk Queue'}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await event.respond(stat_text, parse_mode='html', buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]])
+
+@client.on(events.NewMessage(pattern=r"^/help$"))
+async def help_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    help_text = (
+        "📖 <b>Help Guide</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>Commands:</b>\n"
+        "• /start - 🚀 Open main menu & status\n"
+        "• /download [url] - 📥 Download all items\n"
+        "• /bunkr [url] - ⚡ Quick Bunkr scraper\n"
+        "• /stats - 📊 Storage & bot stats\n"
+        "• /help - ❓ Show this guide\n\n"
+        "<b>Usage:</b>\n"
+        "Paste any Coomer profile, post, or Bunkr URL directly into this chat."
+    )
+    await event.respond(help_text, parse_mode='html')
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 async def set_bot_commands():
@@ -1393,11 +1498,17 @@ async def set_bot_commands():
 
 async def main():
     print("🚀 Starting Bot...")
-    await client.start(bot_token=BOT_TOKEN)
+    if MISTRAL_API_KEY:
+        logger.info("Mistral AI naming & metadata: active")
+    else:
+        logger.info("Mistral AI naming & metadata: inactive (MISTRAL_API_KEY not set)")
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.sign_in(bot_token=BOT_TOKEN)
     print("✅ Setting commands...")
     await set_bot_commands()
     print("✅ Online.")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    client.loop.run_until_complete(main())
+    asyncio.run(main())

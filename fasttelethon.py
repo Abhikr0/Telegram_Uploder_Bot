@@ -21,11 +21,6 @@ from telethon.tl.types import (Document, InputFileLocation, InputDocumentFileLoc
                                InputPhotoFileLocation, InputPeerPhotoFileLocation, TypeInputFile,
                                InputFileBig, InputFile)
 
-try:
-    from mautrix.crypto.attachments import async_encrypt_attachment
-except ImportError:
-    async_encrypt_attachment = None
-
 log: logging.Logger = logging.getLogger("telethon")
 
 TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLocation,
@@ -252,7 +247,8 @@ def stream_file(file_to_stream: BinaryIO, chunk_size=512 * 1024):
 
 async def _internal_transfer_to_telegram(client: TelegramClient,
                                          response: BinaryIO,
-                                         progress_callback: callable
+                                         progress_callback: callable,
+                                         file_name: Optional[str] = None
                                          ) -> Tuple[TypeInputFile, int]:
     file_id = helpers.generate_random_long()
     file_size = os.path.getsize(response.name)
@@ -281,11 +277,11 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
                 await r
 
     await uploader.finish_upload()
-    file_name = os.path.basename(response.name)
+    name = file_name or getattr(response, "name", None) and os.path.basename(response.name) or "video.mp4"
     if is_large:
-        return InputFileBig(file_id, part_count, file_name), file_size
+        return InputFileBig(file_id, part_count, name), file_size
     else:
-        return InputFile(file_id, part_count, file_name, hash_md5.hexdigest()), file_size
+        return InputFile(file_id, part_count, name, hash_md5.hexdigest()), file_size
 
 
 async def download_file(client: TelegramClient,
@@ -311,9 +307,9 @@ async def download_file(client: TelegramClient,
 async def upload_file(client: TelegramClient,
                       file: BinaryIO,
                       progress_callback: callable = None,
-
+                      file_name: Optional[str] = None
                       ) -> TypeInputFile:
-    res = (await _internal_transfer_to_telegram(client, file, progress_callback))[0]
+    res = (await _internal_transfer_to_telegram(client, file, progress_callback, file_name=file_name))[0]
     return res
 
 

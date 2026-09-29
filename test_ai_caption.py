@@ -14,7 +14,7 @@ if sys.platform == "win32":
 # Load UploderBot .env
 load_dotenv()
 
-from ai_caption import generate_ai_caption, _build_fallback_caption, _escape
+from ai_caption import generate_ai_caption, _build_fallback_caption, _escape, generate_ai_name
 
 async def test_caption():
     print("🧪 Running AI Caption & Metadata Tests...\n")
@@ -33,11 +33,13 @@ async def test_caption():
     print("--- Test 1: Fallback Caption Generator ---")
     fallback = _build_fallback_caption(mock_vid["title"], mock_vid["content"], service, creator, mock_vid["id"])
     print(f"Clean Title: {fallback['clean_title']}")
+    print(f"File Name: {fallback['file_name']}")
     print(f"Hashtags: {fallback['hashtags']}")
     print(f"DB Title: {fallback['db_title']}")
     print("Rich Caption:\n" + fallback["rich_caption"])
     print(f"Caption Length: {len(fallback['rich_caption'])} chars (Telegram limit is 1024)\n")
     assert len(fallback["rich_caption"]) <= 1024, "Fallback caption exceeds 1024 chars!"
+    assert fallback["file_name"].endswith(".mp4"), "Missing .mp4 extension"
     assert "#Onlyfans" in fallback["hashtags"] or "#onlyfans" in [t.lower() for t in fallback["hashtags"]]
     print("✅ Test 1 Passed!\n")
 
@@ -45,10 +47,12 @@ async def test_caption():
     print("--- Test 2: generate_ai_caption() (Fallback/Live) ---")
     res = await generate_ai_caption(mock_vid, service, creator)
     print(f"Clean Title: {res['clean_title']}")
+    print(f"File Name: {res['file_name']}")
     print(f"Hashtags: {res['hashtags']}")
     print(f"DB Title: {res['db_title']}")
     print(f"Caption Length: {len(res['rich_caption'])} chars")
     assert len(res["rich_caption"]) <= 1024, "Generated caption exceeds 1024 chars!"
+    assert res["file_name"].endswith(".mp4")
     assert "<b>" in res["rich_caption"] and "</b>" in res["rich_caption"], "Missing HTML tags"
     print("✅ Test 2 Passed!\n")
 
@@ -58,7 +62,7 @@ async def test_caption():
     ai_json = {
         "choices": [{
             "message": {
-                "content": '{"clean_title": "Sunset Beach Shoot <Exclusive> & BTS", "summary": "Exclusive photoshoot on the beach with sunset lighting & behind-the-scenes moments.", "hashtags": ["#BeachVibes", "#SunsetShoot", "#Exclusive", "#OnlyFans", "#BTS", "#ModelLife"]}'
+                "content": '{"clean_title": "Sunset Beach Shoot <Exclusive> & BTS", "file_name": "Sunset_Beach_Shoot_BTS.mp4", "summary": "Exclusive photoshoot on the beach with sunset lighting & behind-the-scenes moments.", "hashtags": ["#BeachVibes", "#SunsetShoot", "#Exclusive", "#OnlyFans", "#BTS", "#ModelLife"]}'
             }
         }]
     }
@@ -72,12 +76,18 @@ async def test_caption():
         with mock.patch("httpx.AsyncClient.post", return_value=MockResponse()):
             mocked_res = await generate_ai_caption(mock_vid, service, creator)
             print(f"Mocked Clean Title: {mocked_res['clean_title']}")
+            print(f"Mocked File Name: {mocked_res['file_name']}")
             print(f"Mocked Hashtags: {mocked_res['hashtags']}")
             print("Mocked Caption:\n" + mocked_res["rich_caption"])
+            assert mocked_res["file_name"] == "Sunset_Beach_Shoot_BTS.mp4"
             assert "&lt;Exclusive&gt;" in mocked_res["rich_caption"], "HTML angle brackets not escaped!"
             assert "&amp;" in mocked_res["rich_caption"], "HTML ampersand not escaped!"
             assert len(mocked_res["rich_caption"]) <= 1024
             print("✅ Test 3 Passed!\n")
+
+    ai_name = await generate_ai_name("a4b9c1d02e_clip.mp4", "bunkr", "album")
+    assert ai_name.endswith(".mp4")
+    print(f"Generated AI Name: {ai_name}")
 
     print("🎉 All AI Caption tests completed successfully!")
 
