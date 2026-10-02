@@ -412,12 +412,13 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
     try:
         domain, service, cur_user_id, post_id = parse_media_url(url)
         if not domain: 
-            await event.respond("❌ <b>Invalid URL.</b>\nSupported formats: Coomer creator/post URLs, Bunkr album/video URLs.", parse_mode='html')
+            await event.respond("❌ <b>Invalid URL.</b>\nSupported formats: Viralchut, Coomer creator/post URLs, Bunkr album/video URLs.", parse_mode='html')
             return
             
         page_range = parse_page_range(page_range_str) if page_range_str else None
         
-        temp_dir = Path(DOWNLOAD_DIR) / f"{service}_{cur_user_id}_{event.id}"
+        safe_folder = re.sub(r'[^a-zA-Z0-9_-]', '_', f"{service}_{cur_user_id}_{event.id}")[:64]
+        temp_dir = Path(DOWNLOAD_DIR) / safe_folder
         temp_dir.mkdir(parents=True, exist_ok=True)
 
         if selected_videos:
@@ -963,6 +964,8 @@ async def start_handler(event):
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Welcome! I scrape, download, and archive media directly into Telegram storage with MTProto multi-chunk speeds.\n\n"
         "⚡ <b>Supported Sources:</b>\n"
+        "• <b>Universal Web Scraper & Crawler:</b> Any website, tube, blog, gallery, or direct video\n"
+        "• <b>Viralchut:</b> Single videos, Categories, Tags, Search, Latest\n"
         "• <b>Bunkr:</b> Albums (<code>/a/</code>) & Videos (<code>/v/</code>, <code>/f/</code>)\n"
         "• <b>Coomer / Kemono:</b> Creator profiles & single posts\n\n"
         "📊 <b>Current System Overview:</b>\n"
@@ -1016,11 +1019,12 @@ async def callback_handler(event):
         await event.respond(
             "🔗 <b>Step 1: From Where?</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send the Coomer profile or Bunkr URL you want to scrape.\n\n"
+            "Please send the Viralchut, Coomer profile, or Bunkr URL you want to scrape.\n\n"
             "💡 <i>Examples:</i>\n"
-            "• <code>https://coomer.st/onlyfans/user/example</code>\n"
+            "• <code>https://viralchut.com/video-slug/</code>\n"
+            "• <code>https://viralchut.com/category/desi-sex-scandal/</code>\n"
             "• <code>https://bunkr.cr/a/album_id</code>\n"
-            "• <code>https://bunkr.cr/v/video_id</code>", 
+            "• <code>https://coomer.st/onlyfans/user/example</code>", 
             parse_mode='html',
             buttons=[Button.inline("❌ Cancel", b"cancel_flow")]
         )
@@ -1077,6 +1081,7 @@ async def callback_handler(event):
             "<b>Commands:</b>\n"
             "• /start - 🚀 Open main menu\n"
             "• /download [url] - 📥 Quick download\n"
+            "• /viralchut [url] - 🔥 Quick Viralchut scraper\n"
             "• /bunkr [url] - ⚡ Quick Bunkr scraper\n"
             "• /help - ❓ Show this guide\n\n"
             "<b>Interactive Flow:</b>\n"
@@ -1355,6 +1360,8 @@ async def message_handler(event):
                 await event.respond(
                     "❌ <b>Unsupported URL format.</b>\n"
                     "Supported formats:\n"
+                    "• <code>https://viralchut.com/video-slug/</code>\n"
+                    "• <code>https://viralchut.com/category/name/</code>\n"
                     "• <code>https://bunkr.cr/a/album_id</code>\n"
                     "• <code>https://bunkr.cr/v/video_id</code>\n"
                     "• <code>https://coomer.st/onlyfans/user/...</code>",
@@ -1414,14 +1421,78 @@ async def download_handler(event):
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Simply <b>paste any link</b> directly into this chat, or use:\n\n"
             "• <code>/download &lt;url&gt;</code> - Download all items\n"
-            "• <code>/download &lt;url&gt; &lt;pages&gt;</code> - Download specific pages (e.g. <code>1-3</code>)\n\n"
+            "• <code>/download &lt;url&gt; &lt;pages&gt;</code> - Download specific pages (e.g. <code>1-3</code>)\n"
+            "• <code>/crawl &lt;url&gt;</code> - Crawl & select videos from any webpage\n\n"
             "<b>Supported Platforms:</b>\n"
+            "• <b>Universal Web:</b> Any website, tube, blog, gallery, or direct media\n"
+            "• <b>Viralchut:</b> Single videos, Categories, Tags, Search\n"
             "• <b>Bunkr:</b> Albums (<code>/a/</code>) & Videos (<code>/v/</code>, <code>/f/</code>)\n"
             "• <b>Coomer / Kemono:</b> Creator profiles & single posts",
             parse_mode='html'
         )
         return
     asyncio.create_task(download_and_upload(event, url, page_range, STORAGE_CHANNEL_ID))
+
+@client.on(events.NewMessage(pattern=r"^/viralchut(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+async def viralchut_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    url = event.pattern_match.group(1)
+    page_range = event.pattern_match.group(2)
+    if not url:
+        await event.respond(
+            "🔥 <b>Viralchut Scraper</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Usage:\n"
+            "• <code>/viralchut https://viralchut.com/video-slug/</code>\n"
+            "• <code>/viralchut https://viralchut.com/category/desi-sex-scandal/</code>\n"
+            "• <code>/viralchut https://viralchut.com/tag/bhabhi-sex-mms/</code>\n"
+            "• <code>/viralchut https://viralchut.com/ 1-3</code>\n\n"
+            "Or simply paste any Viralchut link directly into this chat!",
+            parse_mode='html'
+        )
+        return
+    asyncio.create_task(download_and_upload(event, url, page_range, STORAGE_CHANNEL_ID))
+
+@client.on(events.NewMessage(pattern=r"^/crawl(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+async def crawl_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    url = event.pattern_match.group(1)
+    page_range = event.pattern_match.group(2)
+    if not url:
+        await event.respond(
+            "🕷️ <b>Universal Web Video Crawler</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Crawl and scrape video links from <b>any</b> website, gallery, blog, tube, or profile!\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/crawl https://example.com/gallery/</code>\n"
+            "• <code>/crawl https://example.com/videos/ 1-3</code>\n\n"
+            "Or simply paste any URL directly into this chat!",
+            parse_mode='html'
+        )
+        return
+
+    user_id = event.sender_id
+    USER_STATES[user_id] = {'url': url, 'range': page_range, 'dest': STORAGE_CHANNEL_ID}
+    status_m = await event.respond("⏳ <b>Crawling Webpage for Videos...</b>\nScanning source and extracting file list, please wait...", parse_mode='html')
+    try:
+        domain, service, cur_id, post_id = parse_media_url(url)
+        pr = parse_page_range(page_range) if page_range else None
+        posts = await fetch_all_posts(domain, service, cur_id, page_range=pr, post_id=None)
+        if not posts:
+            await status_m.edit("❌ <b>No videos found on this webpage.</b>", parse_mode='html')
+            return
+        videos = extract_video_urls(domain, posts)
+        if not videos:
+            await status_m.edit("⚠️ <b>No downloadable videos found on this webpage.</b>", parse_mode='html')
+            return
+        USER_STATES[user_id]['videos'] = videos
+        USER_STATES[user_id]['selected'] = set()
+        USER_STATES[user_id]['browser_page'] = 0
+        text, buttons = render_album_browser(user_id)
+        await status_m.edit(text, parse_mode='html', buttons=buttons)
+    except Exception as e:
+        logger.error(f"Error crawling webpage: {e}")
+        await status_m.edit(f"❌ <b>Error crawling webpage:</b> {e}", parse_mode='html')
 
 @client.on(events.NewMessage(pattern=r"^/bunkr(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def bunkr_command_handler(event):
@@ -1472,11 +1543,13 @@ async def help_command_handler(event):
         "<b>Commands:</b>\n"
         "• /start - 🚀 Open main menu & status\n"
         "• /download [url] - 📥 Download all items\n"
+        "• /crawl [url] - 🕷️ Crawl & select videos from any webpage\n"
+        "• /viralchut [url] - 🔥 Quick Viralchut scraper\n"
         "• /bunkr [url] - ⚡ Quick Bunkr scraper\n"
         "• /stats - 📊 Storage & bot stats\n"
         "• /help - ❓ Show this guide\n\n"
         "<b>Usage:</b>\n"
-        "Paste any Coomer profile, post, or Bunkr URL directly into this chat."
+        "Paste <b>any URL</b> (tube site, blog, gallery, social media, leak site, direct video) directly into this chat."
     )
     await event.respond(help_text, parse_mode='html')
 
@@ -1486,6 +1559,8 @@ async def set_bot_commands():
     commands = [
         BotCommand(command="start", description="🚀 Open main menu & status"),
         BotCommand(command="download", description="📥 Download from any URL"),
+        BotCommand(command="crawl", description="🕷️ Crawl & select from any webpage"),
+        BotCommand(command="viralchut", description="🔥 Quick Viralchut scraper"),
         BotCommand(command="bunkr", description="⚡ Quick Bunkr downloader"),
         BotCommand(command="stats", description="📊 Show uploader & storage stats"),
         BotCommand(command="help", description="❓ Show help guide"),
