@@ -77,7 +77,7 @@ def extract_name_tags(raw_title: str) -> list[str]:
                     tags.add(f"#{p.title()}")
     return sorted(list(tags))
 
-def _build_fallback_caption(raw_title: str, content: str, service: str, creator: str, vid_id: str) -> Dict[str, Any]:
+def _build_fallback_caption(raw_title: str, content: str, service: str, creator: str, vid_id: str, vid: Dict[str, Any] = None) -> Dict[str, Any]:
     """Generates standard caption with broken tags when Mistral AI is unavailable or disabled."""
     clean_title = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", raw_title)
     clean_title = re.sub(r"^\d+[-_\s]+", "", clean_title)
@@ -98,6 +98,19 @@ def _build_fallback_caption(raw_title: str, content: str, service: str, creator:
     if creator:
         cr = _sanitize_hashtag(creator.replace("-", "_").replace(" ", "_"))
         if cr: all_tags.add(cr)
+
+    if vid and isinstance(vid, dict):
+        if vid.get("platform"):
+            p_tag = _sanitize_hashtag(vid["platform"])
+            if p_tag: all_tags.add(p_tag)
+        for act in vid.get("actors", []):
+            if act:
+                a_tag = _sanitize_hashtag(act.replace("-", "_").replace(" ", "_"))
+                if a_tag: all_tags.add(a_tag)
+                # Also CamelCase version e.g. #BhartiJha
+                cc_tag = _sanitize_hashtag("".join(w.capitalize() for w in act.split()))
+                if cc_tag: all_tags.add(cc_tag)
+
     all_tags.add("#Video")
     all_tags.add("#Archive")
 
@@ -138,7 +151,7 @@ async def generate_ai_caption(vid: Dict[str, Any], service: str, creator: str) -
     content = (vid.get("content") or "").strip()
     vid_id = str(vid.get("id", ""))
 
-    fallback = _build_fallback_caption(raw_title, content, service, creator, vid_id)
+    fallback = _build_fallback_caption(raw_title, content, service, creator, vid_id, vid=vid)
 
     if not api_key:
         logger.debug("MISTRAL_API_KEY not set. Using fallback caption generator.")

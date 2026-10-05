@@ -964,6 +964,8 @@ async def start_handler(event):
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Welcome! I scrape, download, and archive media directly into Telegram storage with MTProto multi-chunk speeds.\n\n"
         "⚡ <b>Supported Sources:</b>\n"
+        "• <b>UXSeries:</b> Actresses, Series, Episodes, Platforms (<code>https://uxseries.co/</code>)\n"
+        "• <b>HDMaal:</b> Models, OTT, Web Series (<code>https://hdmaal.movie/</code>)\n"
         "• <b>Universal Web Scraper & Crawler:</b> Any website, tube, blog, gallery, or direct video\n"
         "• <b>Viralchut:</b> Single videos, Categories, Tags, Search, Latest\n"
         "• <b>Bunkr:</b> Albums (<code>/a/</code>) & Videos (<code>/v/</code>, <code>/f/</code>)\n"
@@ -1019,10 +1021,13 @@ async def callback_handler(event):
         await event.respond(
             "🔗 <b>Step 1: From Where?</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send the Viralchut, Coomer profile, or Bunkr URL you want to scrape.\n\n"
+            "Please send the UXSeries, HDMaal, Viralchut, Coomer, or Bunkr URL you want to scrape.\n\n"
             "💡 <i>Examples:</i>\n"
+            "• <code>https://uxseries.co/actress/bharti-jha/</code>\n"
+            "• <code>https://hdmaal.movie/model/bharti-jha/</code>\n"
+            "• <code>https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
+            "• <code>https://uxseries.co/series/shatir/</code>\n"
             "• <code>https://viralchut.com/video-slug/</code>\n"
-            "• <code>https://viralchut.com/category/desi-sex-scandal/</code>\n"
             "• <code>https://bunkr.cr/a/album_id</code>\n"
             "• <code>https://coomer.st/onlyfans/user/example</code>", 
             parse_mode='html',
@@ -1360,6 +1365,11 @@ async def message_handler(event):
                 await event.respond(
                     "❌ <b>Unsupported URL format.</b>\n"
                     "Supported formats:\n"
+                    "• <code>https://uxseries.co/actress/bharti-jha/</code>\n"
+                    "• <code>https://hdmaal.movie/model/bharti-jha/</code>\n"
+                    "• <code>https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
+                    "• <code>https://uxseries.co/series/shatir/</code>\n"
+                    "• <code>https://uxseries.co/episode/shatir-episode-1/</code>\n"
                     "• <code>https://viralchut.com/video-slug/</code>\n"
                     "• <code>https://viralchut.com/category/name/</code>\n"
                     "• <code>https://bunkr.cr/a/album_id</code>\n"
@@ -1448,6 +1458,49 @@ async def viralchut_command_handler(event):
             "• <code>/viralchut https://viralchut.com/tag/bhabhi-sex-mms/</code>\n"
             "• <code>/viralchut https://viralchut.com/ 1-3</code>\n\n"
             "Or simply paste any Viralchut link directly into this chat!",
+            parse_mode='html'
+        )
+        return
+    asyncio.create_task(download_and_upload(event, url, page_range, STORAGE_CHANNEL_ID))
+
+@client.on(events.NewMessage(pattern=r"^/uxseries(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+async def uxseries_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    url = event.pattern_match.group(1)
+    page_range = event.pattern_match.group(2)
+    if not url:
+        await event.respond(
+            "✨ <b>UXSeries Scraper</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Scrape HD Web Series, Actresses, Episodes & Platforms from UXSeries!\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/uxseries https://uxseries.co/actress/bharti-jha/</code>\n"
+            "• <code>/uxseries https://uxseries.co/actress/bharti-jha/ 1-2</code>\n"
+            "• <code>/uxseries https://uxseries.co/series/shatir/</code>\n"
+            "• <code>/uxseries https://uxseries.co/episode/shatir-episode-1/</code>\n"
+            "• <code>/uxseries https://uxseries.co/platform/ullu/</code>\n\n"
+            "Or simply paste any UXSeries link directly into this chat!",
+            parse_mode='html'
+        )
+        return
+    asyncio.create_task(download_and_upload(event, url, page_range, STORAGE_CHANNEL_ID))
+
+@client.on(events.NewMessage(pattern=r"^/hdmaal(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+async def hdmaal_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    url = event.pattern_match.group(1)
+    page_range = event.pattern_match.group(2)
+    if not url:
+        await event.respond(
+            "🎬 <b>HDMaal Scraper</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Scrape 18+ Web Series, Models, Episodes & OTTs from HDMaal!\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/hdmaal https://hdmaal.movie/model/bharti-jha/</code>\n"
+            "• <code>/hdmaal https://hdmaal.movie/model/bharti-jha/ 1-2</code>\n"
+            "• <code>/hdmaal https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
+            "• <code>/hdmaal https://hdmaal.movie/ott/voovi/</code>\n\n"
+            "Or simply paste any HDMaal link directly into this chat!",
             parse_mode='html'
         )
         return
@@ -1544,6 +1597,8 @@ async def help_command_handler(event):
         "• /start - 🚀 Open main menu & status\n"
         "• /download [url] - 📥 Download all items\n"
         "• /crawl [url] - 🕷️ Crawl & select videos from any webpage\n"
+        "• /uxseries [url] - ✨ Quick UXSeries scraper\n"
+        "• /hdmaal [url] - 🎬 Quick HDMaal scraper\n"
         "• /viralchut [url] - 🔥 Quick Viralchut scraper\n"
         "• /bunkr [url] - ⚡ Quick Bunkr scraper\n"
         "• /stats - 📊 Storage & bot stats\n"
@@ -1560,6 +1615,8 @@ async def set_bot_commands():
         BotCommand(command="start", description="🚀 Open main menu & status"),
         BotCommand(command="download", description="📥 Download from any URL"),
         BotCommand(command="crawl", description="🕷️ Crawl & select from any webpage"),
+        BotCommand(command="uxseries", description="✨ Quick UXSeries scraper"),
+        BotCommand(command="hdmaal", description="🎬 Quick HDMaal scraper"),
         BotCommand(command="viralchut", description="🔥 Quick Viralchut scraper"),
         BotCommand(command="bunkr", description="⚡ Quick Bunkr downloader"),
         BotCommand(command="stats", description="📊 Show uploader & storage stats"),

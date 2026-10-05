@@ -70,6 +70,8 @@ def decode_cf_email(cf_hex: str) -> str:
 def get_headers(domain=DEFAULT_DOMAIN, referer=None, is_media: bool = False):
     is_bunkr = any(x in domain.lower() for x in ["bunkr", "balbums", "cdn.cr"])
     is_viralchut = any(x in domain.lower() for x in ["viralchut", "desibp"])
+    is_uxseries = any(x in domain.lower() for x in ["uxseries", "azmaal"])
+    is_hdmaal = any(x in domain.lower() for x in ["hdmaal", "pmaal", "maalcdn"])
     is_coomer = any(x in domain.lower() for x in ["coomer", "kemono"])
 
     if is_bunkr:
@@ -78,6 +80,12 @@ def get_headers(domain=DEFAULT_DOMAIN, referer=None, is_media: bool = False):
     elif is_viralchut:
         accept_val = "*/*" if is_media else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         default_referer = "https://viralchut.com/"
+    elif is_uxseries:
+        accept_val = "*/*" if is_media else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        default_referer = "https://uxseries.co/"
+    elif is_hdmaal:
+        accept_val = "*/*" if is_media else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        default_referer = "https://hdmaal.movie/"
     elif is_coomer:
         accept_val = "text/css" if not is_media else "*/*"
         default_referer = f"https://{domain}/"
@@ -93,7 +101,7 @@ def get_headers(domain=DEFAULT_DOMAIN, referer=None, is_media: bool = False):
         "Connection": "keep-alive",
         "Sec-Fetch-Dest": "video" if is_media else ("empty" if is_coomer else "document"),
         "Sec-Fetch-Mode": "navigate" if (not is_media and not is_coomer) else "cors",
-        "Sec-Fetch-Site": "cross-site" if (is_bunkr or is_viralchut or not is_coomer) else "same-origin",
+        "Sec-Fetch-Site": "cross-site" if (is_bunkr or is_viralchut or is_uxseries or is_hdmaal or not is_coomer) else "same-origin",
     }
     if is_bunkr:
         headers["Origin"] = "https://bunkr.cr"
@@ -136,6 +144,92 @@ def parse_media_url(url: str) -> Tuple[Optional[str], Optional[str], Optional[st
         slug = clean_path.strip("/")
         if slug and slug not in ("categories", "tags"):
             return domain, "viralchut", slug, slug
+
+    # 2. Support UXSeries URLs (Actresses, Series, Episodes, Platforms, Tags, Catalogs)
+    if "uxseries" in domain_lower:
+        if "s" in query_params:
+            q = query_params["s"][0].strip()
+            return domain, "uxseries", f"search/{q}", None
+
+        # Episode: /episode/slug (single video post)
+        ep_match = re.match(r"^/episode/([^/?#]+)", clean_path)
+        if ep_match:
+            ep_slug = ep_match.group(1)
+            return domain, "uxseries", ep_slug, ep_slug
+
+        # Actress: /actress/bharti-jha or /actress/bharti-jha/page/2
+        actress_match = re.match(r"^/actress/([^/?#]+)", clean_path)
+        if actress_match:
+            actress_slug = actress_match.group(1)
+            return domain, "uxseries", f"actress/{actress_slug}", None
+
+        # Series: /series/shatir or /series/shatir/page/2
+        series_match = re.match(r"^/series/([^/?#]+)", clean_path)
+        if series_match:
+            series_slug = series_match.group(1)
+            return domain, "uxseries", f"series/{series_slug}", None
+
+        # Platform: /platform/ullu
+        platform_match = re.match(r"^/platform/([^/?#]+)", clean_path)
+        if platform_match:
+            platform_slug = platform_match.group(1)
+            return domain, "uxseries", f"platform/{platform_slug}", None
+
+        # Tag: /tags?/name
+        tag_match = re.match(r"^/tags?/([^/?#]+)", clean_path)
+        if tag_match:
+            tag_slug = tag_match.group(1)
+            return domain, "uxseries", f"tag/{tag_slug}", None
+
+        # Category: /categor(y|ies)/name
+        cat_match = re.match(r"^/categor(?:y|ies)/([^/?#]+)", clean_path)
+        if cat_match:
+            cat_slug = cat_match.group(1)
+            return domain, "uxseries", f"category/{cat_slug}", None
+
+        # Catalog: /episodes, /popular, /latest, /page/\d+, or root
+        if re.search(r"^/(episodes|popular|series|actress|platform)", clean_path) or re.match(r"^/page/\d+", clean_path) or clean_path in ("", "/"):
+            sub = clean_path.strip("/").split("/")[0] or "episodes"
+            return domain, "uxseries", sub, None
+
+        # Fallback slug: single video post
+        slug = clean_path.strip("/")
+        if slug:
+            return domain, "uxseries", slug, slug
+
+    # 3. Support HDMaal URLs (Models, OTT, Web Series, Topics, Single Videos)
+    if "hdmaal" in domain_lower:
+        if "s" in query_params:
+            q = query_params["s"][0].strip()
+            return domain, "hdmaal", f"search/{q}", None
+
+        # Model: /model/bharti-jha or /model/bharti-jha/page/2
+        model_match = re.match(r"^/model/([^/?#]+)", clean_path)
+        if model_match:
+            model_slug = model_match.group(1)
+            return domain, "hdmaal", f"model/{model_slug}", None
+
+        # OTT: /ott/voovi or /ott/ullu
+        ott_match = re.match(r"^/ott/([^/?#]+)", clean_path)
+        if ott_match:
+            ott_slug = ott_match.group(1)
+            return domain, "hdmaal", f"ott/{ott_slug}", None
+
+        # Topic: /topic/name
+        topic_match = re.match(r"^/topic/([^/?#]+)", clean_path)
+        if topic_match:
+            topic_slug = topic_match.group(1)
+            return domain, "hdmaal", f"topic/{topic_slug}", None
+
+        # Catalog / Latest / Web-Series: /web-series, /page/\d+, or root
+        if re.search(r"^/(web-series|model|ott|topic)", clean_path) or re.match(r"^/page/\d+", clean_path) or clean_path in ("", "/"):
+            sub = clean_path.strip("/").split("/")[0] or "web-series"
+            return domain, "hdmaal", sub, None
+
+        # Single video post
+        slug = clean_path.strip("/")
+        if slug:
+            return domain, "hdmaal", slug, slug
 
     # 2. Support Bunkr URLs (albums and single items across all mirrors)
     is_bunkr = any(x in domain_lower for x in ["bunkr", "balbums"])
@@ -676,6 +770,608 @@ async def resolve_viralchut_direct_url(page_url: str, headers: dict = None, clie
         if close_client:
             await client.aclose()
 
+def extract_uxseries_post_data(html: str, page_url: str) -> dict:
+    """Extract metadata, direct CDN video URL, poster, and title from a UXSeries episode page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Title
+    title = ""
+    og_title = soup.find("meta", property="og:title")
+    if og_title and og_title.get("content"):
+        title = og_title["content"].strip()
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True)
+    if not title and soup.title:
+        title = soup.title.get_text(strip=True)
+
+    # Clean UXSeries suffixes
+    title = re.sub(r"\s*-\s*UXSeries.*$", "", title, flags=re.I).strip()
+    title = re.sub(r"\s*Watch Now.*$", "", title, flags=re.I).strip()
+
+    # 2. JSON-LD VideoObject Schema
+    schema_data = {}
+    for s in soup.find_all("script", type="application/ld+json"):
+        try:
+            j = json.loads(s.string)
+            graph = j.get("@graph", [j]) if isinstance(j, dict) else []
+            for item in graph:
+                if isinstance(item, dict) and item.get("@type") == "VideoObject":
+                    schema_data = item
+                    break
+            if schema_data:
+                break
+        except Exception:
+            pass
+
+    # 3. Direct CDN Video URL
+    video_url = None
+    facade = soup.find(attrs={"data-video-src": True})
+    if facade and facade.get("data-video-src"):
+        video_url = facade["data-video-src"]
+
+    if not video_url and schema_data:
+        video_url = schema_data.get("contentUrl") or schema_data.get("embedUrl")
+
+    if not video_url:
+        for v in soup.find_all("video"):
+            for src_tag in v.find_all("source"):
+                if src_tag.get("src"):
+                    video_url = src_tag["src"]
+                    break
+            if not video_url and v.get("src"):
+                video_url = v["src"]
+            if video_url:
+                break
+
+    if not video_url:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if any(href.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                video_url = href
+                break
+            if "cdn.azmaal.com" in href:
+                video_url = href
+                break
+
+    # 4. Poster / Thumbnail
+    poster = None
+    if schema_data.get("thumbnailUrl"):
+        poster = schema_data["thumbnailUrl"]
+    if not poster:
+        poster_img = soup.find(class_=re.compile(r"sv-ep-player-poster-img|sv-vcard-thumb-img"))
+        if poster_img:
+            poster = poster_img.get("src") or poster_img.get("data-src")
+    if not poster:
+        og_img = soup.find("meta", property="og:image")
+        if og_img:
+            poster = og_img.get("content")
+
+    # 5. Actors / Cast
+    actors = []
+    if schema_data.get("actor"):
+        for act in schema_data["actor"]:
+            if isinstance(act, dict) and act.get("name"):
+                actors.append(act["name"])
+            elif isinstance(act, str):
+                actors.append(act)
+    if not actors:
+        for a in soup.find_all("a", href=re.compile(r"/actress/")):
+            name = a.get_text(strip=True)
+            if name and name not in actors and name.lower() not in ["actress", "actresses"]:
+                actors.append(name)
+
+    # 6. Description
+    description = ""
+    if schema_data.get("description"):
+        description = schema_data["description"]
+    if not description:
+        for p in soup.find_all("p", class_=re.compile(r"entry-content|description|wp-block-paragraph")):
+            t = p.get_text(strip=True)
+            if t and len(t) > len(description):
+                description = t
+
+    # 7. Post ID
+    post_id = None
+    body = soup.find("body")
+    if body and body.get("class"):
+        for cls in body.get("class"):
+            m = re.match(r"postid-(\d+)", cls)
+            if m:
+                post_id = m.group(1)
+                break
+    if not post_id:
+        slug = urlparse(page_url).path.strip("/").split("/")[-1]
+        post_id = slug or "unk"
+
+    # 8. Filename
+    filename = ""
+    if video_url:
+        filename = unquote(Path(urlparse(video_url).path).name)
+    if not filename or filename in ["video.mp4", "player.mp4"]:
+        filename = f"{title}.mp4" if title else f"uxseries_{post_id}.mp4"
+
+    return {
+        "id": post_id,
+        "title": title,
+        "url": video_url,
+        "poster": poster,
+        "thumbnail": poster,
+        "description": description,
+        "filename": filename,
+        "actors": actors
+    }
+
+async def fetch_uxseries_post(domain: str, post_id: str, client: httpx.AsyncClient = None) -> list[dict]:
+    """Fetch and parse a single UXSeries episode page into standard post item format."""
+    if post_id.startswith("http"):
+        url = post_id
+    elif post_id.startswith("episode/"):
+        url = f"https://{domain}/{post_id}/"
+    else:
+        url = f"https://{domain}/episode/{post_id}/"
+    headers = get_headers(domain, f"https://{domain}/")
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        data = extract_uxseries_post_data(resp.text, url)
+        if not data.get("url"):
+            return []
+        return [{
+            "id": data["id"],
+            "service": "uxseries",
+            "name": sanitize(data["filename"]),
+            "title": data["title"],
+            "content": data["description"][:300],
+            "url": data["url"],
+            "uxseries_url": url,
+            "thumbnail": data["poster"],
+            "poster": data["poster"],
+            "actors": data.get("actors", []),
+            "user": (data.get("actors") and data["actors"][0]) or "uxseries",
+            "file": {
+                "path": data["url"],
+                "name": sanitize(data["filename"])
+            }
+        }]
+    except Exception as e:
+        logger.error(f"Failed to fetch UXSeries episode {post_id}: {e}")
+        return []
+    finally:
+        if close_client:
+            await client.aclose()
+
+async def fetch_uxseries_listing(domain: str, target: str, page_range: tuple[int, int] | None = None, client: httpx.AsyncClient = None) -> list[dict]:
+    """Fetch video items across pages from a UXSeries actress, series, platform, tag, or catalog listing."""
+    all_items = []
+    headers = get_headers(domain, f"https://{domain}/")
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+
+    try:
+        def get_page_url(p: int) -> str:
+            clean_tgt = target.strip("/")
+            if clean_tgt in ("latest", "", "home"):
+                return f"https://{domain}/page/{p}/" if p > 1 else f"https://{domain}/"
+            elif clean_tgt in ("episodes", "popular", "series", "actress", "platform", "tags"):
+                return f"https://{domain}/{clean_tgt}/page/{p}/" if p > 1 else f"https://{domain}/{clean_tgt}/"
+            else:
+                return f"https://{domain}/{clean_tgt}/page/{p}/" if p > 1 else f"https://{domain}/{clean_tgt}/"
+
+        url_p1 = get_page_url(1)
+        resp_p1 = await client.get(url_p1)
+        if resp_p1.status_code == 404:
+            return []
+        resp_p1.raise_for_status()
+        soup_p1 = BeautifulSoup(resp_p1.text, "html.parser")
+
+        # Determine max_page from pagination
+        max_page = 1
+        pagination = soup_p1.find(class_=re.compile(r"sv-pages|page-numbers|pagination"))
+        if pagination:
+            nums = [int(x) for x in re.findall(r'/page/(\d+)/', str(pagination))]
+            nums += [int(x.get_text(strip=True)) for x in pagination.find_all(class_=re.compile(r"page-numbers")) if x.get_text(strip=True).isdigit()]
+            if nums:
+                max_page = max(nums)
+
+        start_p = 1
+        end_p = max_page
+        if page_range:
+            start_p, end_p = page_range
+            end_p = min(end_p, max_page)
+
+        creator_name = target.split("/")[-1].replace("-", " ").title() if "/" in target else target.replace("-", " ").title()
+
+        seen_links = set()
+        for p in range(start_p, end_p + 1):
+            if p == 1:
+                soup = soup_p1
+            else:
+                p_url = get_page_url(p)
+                p_resp = await client.get(p_url)
+                if p_resp.status_code != 200:
+                    break
+                soup = BeautifulSoup(p_resp.text, "html.parser")
+
+            cards = soup.find_all("article", class_=re.compile(r"sv-vcard|episode|post"))
+            if not cards:
+                cards = soup.find_all("article")
+
+            for card in cards:
+                a_link = card.find("a", href=re.compile(r"/episode/[^/?#]+")) or card.find("a", class_=re.compile(r"sv-vcard-link|body-link")) or card.find("a", href=True)
+                if not a_link or not a_link.get("href"):
+                    continue
+                href = a_link["href"]
+                if "/episode/" not in href or href in seen_links:
+                    continue
+                seen_links.add(href)
+
+                fav_btn = card.find("button", attrs={"data-fav-id": True})
+                card_id = fav_btn["data-fav-id"] if fav_btn else urlparse(href).path.strip("/").split("/")[-1]
+
+                title_elem = card.find(class_=re.compile(r"title|sv-vcard-title")) or card.find("h3") or card.find("h2")
+                title = title_elem.get_text(strip=True) if title_elem else a_link.get("aria-label", "") or card_id
+                title = re.sub(r"\s*-\s*UXSeries.*$", "", title, flags=re.I).strip()
+                title = re.sub(r"\s*Watch Now.*$", "", title, flags=re.I).strip()
+
+                img = card.find("img")
+                thumb = img.get("src") or img.get("data-src") if img else None
+
+                dur_elem = card.find(class_=re.compile(r"dur|duration"))
+                dur_raw = dur_elem.get_text(strip=True) if dur_elem else ""
+                dur_text = dur_raw.split("•")[0].split("·")[0].strip()
+
+                plat_elem = card.find(class_=re.compile(r"plat|platform"))
+                plat_text = plat_elem.get_text(strip=True) if plat_elem else ""
+
+                all_items.append({
+                    "id": str(card_id),
+                    "service": "uxseries",
+                    "name": sanitize(title) + ".mp4",
+                    "title": title,
+                    "url": href,
+                    "uxseries_url": href,
+                    "thumbnail": thumb,
+                    "poster": thumb,
+                    "duration": dur_text,
+                    "platform": plat_text,
+                    "user": creator_name,
+                    "file": {
+                        "path": href,
+                        "name": sanitize(title) + ".mp4"
+                    }
+                })
+
+        print(f"\n[OK] Fetched {len(all_items)} episodes from UXSeries ({target}, pages {start_p}-{end_p}).")
+        return all_items
+    except Exception as e:
+        logger.error(f"Error scraping UXSeries listing for {target}: {e}")
+        return all_items
+    finally:
+        if close_client:
+            await client.aclose()
+
+async def resolve_uxseries_direct_url(page_url: str, headers: dict = None, client: httpx.AsyncClient = None) -> tuple[str, str, dict]:
+    """Resolve a UXSeries episode page URL to the direct CDN video URL and filename."""
+    clean = page_url.split("?")[0].lower()
+    if any(clean.endswith(ext) for ext in VIDEO_EXTENSIONS) and "uxseries.co" not in clean:
+        filename = unquote(Path(urlparse(page_url).path).name)
+        return page_url, sanitize(filename), {}
+
+    close_client = False
+    if client is None:
+        if headers is None:
+            headers = get_headers("uxseries.co", "https://uxseries.co/")
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+    try:
+        resp = await client.get(page_url)
+        resp.raise_for_status()
+        data = extract_uxseries_post_data(resp.text, page_url)
+        direct_url = data.get("url") or page_url
+        filename = data.get("filename") or "video.mp4"
+        return direct_url, sanitize(filename), data
+    except Exception as e:
+        logger.error(f"Failed to resolve UXSeries episode {page_url}: {e}")
+        return page_url, "video.mp4", {}
+    finally:
+        if close_client:
+            await client.aclose()
+
+def extract_hdmaal_post_data(html: str, page_url: str) -> dict:
+    """Extract metadata, direct CDN video URL, poster, and title from an HDMaal post page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. JSON-LD VideoObject Schema
+    schema_data = {}
+    for s in soup.find_all("script", type=re.compile(r"ld\+json", re.I)):
+        try:
+            j = json.loads(s.string)
+            graph = j.get("@graph", [j]) if isinstance(j, dict) else (j if isinstance(j, list) else [])
+            for item in graph:
+                if isinstance(item, dict) and item.get("@type") == "VideoObject":
+                    schema_data = item
+                    break
+            if schema_data:
+                break
+        except Exception:
+            pass
+
+    # 2. Title
+    title = ""
+    if schema_data.get("name"):
+        title = schema_data["name"].strip()
+    if not title:
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            title = og_title["content"].strip()
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True)
+    if not title and soup.title:
+        title = soup.title.get_text(strip=True)
+
+    title = re.sub(r"^(VOOVI|ULLU|PrimePlay|Kooku):\s*(?:Watch\s+)?", "", title, flags=re.I).strip()
+    title = re.sub(r"\s*-\s*HDMaal.*$", "", title, flags=re.I).strip()
+    title = re.sub(r"\s*Watch\s+Now.*$", "", title, flags=re.I).strip()
+
+    # 3. Direct CDN Video URL
+    video_url = None
+    if schema_data.get("contentUrl") or schema_data.get("embedUrl"):
+        video_url = schema_data.get("contentUrl") or schema_data.get("embedUrl")
+
+    if not video_url:
+        for v in soup.find_all("video"):
+            for src_tag in v.find_all("source"):
+                if src_tag.get("src"):
+                    video_url = src_tag["src"]
+                    break
+            if not video_url and v.get("src"):
+                video_url = v["src"]
+            if video_url:
+                break
+
+    if not video_url:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if any(href.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                video_url = href
+                break
+            if any(k in href for k in ["video.maalcdn.com", "cdn.pmaal.com", "cdn.azmaal.com"]):
+                video_url = href
+                break
+
+    # Fix broken video.maalcdn.com domain by routing to active cdn.azmaal.com mirror
+    if video_url and "video.maalcdn.com" in video_url:
+        video_url = video_url.replace("video.maalcdn.com", "cdn.azmaal.com")
+    elif video_url and "maalcdn.com" in video_url and not video_url.startswith("https://cdn.azmaal.com"):
+        video_url = re.sub(r"https?://[^/]*maalcdn\.com", "https://cdn.azmaal.com", video_url)
+
+    # 4. Poster / Thumbnail
+    poster = None
+    if schema_data.get("thumbnailUrl"):
+        poster = schema_data["thumbnailUrl"]
+    if not poster:
+        v_tag = soup.find("video")
+        if v_tag and v_tag.get("poster"):
+            poster = v_tag["poster"]
+    if not poster:
+        og_img = soup.find("meta", property="og:image")
+        if og_img:
+            poster = og_img.get("content")
+
+    # 5. Actors
+    actors = []
+    if schema_data.get("actor"):
+        for act in schema_data["actor"]:
+            if isinstance(act, dict) and act.get("name"):
+                actors.append(act["name"])
+            elif isinstance(act, str):
+                actors.append(act)
+    if not actors:
+        for a in soup.find_all("a", href=re.compile(r"/model/")):
+            name = a.get_text(strip=True)
+            if name and name not in actors and name.lower() not in ["model", "models"]:
+                actors.append(name)
+
+    # 6. Description
+    description = ""
+    if schema_data.get("description"):
+        description = schema_data["description"]
+    if not description:
+        og_desc = soup.find("meta", property="og:description")
+        if og_desc:
+            description = og_desc.get("content", "").strip()
+
+    # 7. Post ID
+    slug = urlparse(page_url).path.strip("/").split("/")[-1]
+    post_id = slug or "unk"
+
+    # 8. Filename
+    filename = ""
+    if video_url:
+        filename = unquote(Path(urlparse(video_url).path).name)
+    if not filename or filename in ["video.mp4", "player.mp4"]:
+        filename = f"{title}.mp4" if title else f"hdmaal_{post_id}.mp4"
+
+    return {
+        "id": post_id,
+        "title": title,
+        "url": video_url,
+        "poster": poster,
+        "thumbnail": poster,
+        "description": description,
+        "filename": filename,
+        "actors": actors
+    }
+
+async def fetch_hdmaal_post(domain: str, post_id: str, client: httpx.AsyncClient = None) -> list[dict]:
+    """Fetch and parse a single HDMaal post page into standard post item format."""
+    url = f"https://{domain}/{post_id}/" if not post_id.startswith("http") else post_id
+    headers = get_headers(domain, f"https://{domain}/")
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        data = extract_hdmaal_post_data(resp.text, url)
+        if not data.get("url"):
+            return []
+        return [{
+            "id": data["id"],
+            "service": "hdmaal",
+            "name": sanitize(data["filename"]),
+            "title": data["title"],
+            "content": data["description"][:300],
+            "url": data["url"],
+            "hdmaal_url": url,
+            "thumbnail": data["poster"],
+            "poster": data["poster"],
+            "actors": data.get("actors", []),
+            "user": (data.get("actors") and data["actors"][0]) or "hdmaal",
+            "file": {
+                "path": data["url"],
+                "name": sanitize(data["filename"])
+            }
+        }]
+    except Exception as e:
+        logger.error(f"Failed to fetch HDMaal post {post_id}: {e}")
+        return []
+    finally:
+        if close_client:
+            await client.aclose()
+
+async def fetch_hdmaal_listing(domain: str, target: str, page_range: tuple[int, int] | None = None, client: httpx.AsyncClient = None) -> list[dict]:
+    """Fetch video items across pages from HDMaal model, OTT, topic, web-series, or latest listing."""
+    all_items = []
+    headers = get_headers(domain, f"https://{domain}/")
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+
+    try:
+        def get_page_url(p: int) -> str:
+            clean_tgt = target.strip("/")
+            if clean_tgt in ("latest", "", "home"):
+                return f"https://{domain}/page/{p}/" if p > 1 else f"https://{domain}/"
+            else:
+                return f"https://{domain}/{clean_tgt}/page/{p}/" if p > 1 else f"https://{domain}/{clean_tgt}/"
+
+        start_p = 1
+        end_p = 50
+        if page_range:
+            start_p, end_p = page_range
+
+        creator_name = target.split("/")[-1].replace("-", " ").title() if "/" in target else target.replace("-", " ").title()
+
+        seen_links = set()
+        for p in range(start_p, end_p + 1):
+            p_url = get_page_url(p)
+            p_resp = await client.get(p_url)
+            if p_resp.status_code != 200:
+                break
+            soup = BeautifulSoup(p_resp.text, "html.parser")
+
+            cards = soup.find_all("a", class_="video")
+            if not cards:
+                cards = [a for a in soup.find_all("a", href=True) if a.get("title") and "hdmaal.movie" in a["href"] and not any(x in a["href"] for x in ["/model/", "/category/", "/tag/", "/ott/", "/topic/", "/author/", "/page/"])]
+
+            if not cards:
+                break
+
+            for card in cards:
+                href = card.get("href")
+                if not href or href in seen_links:
+                    continue
+                seen_links.add(href)
+
+                slug = urlparse(href).path.strip("/").split("/")[-1]
+                title = card.get("title") or (card.find(class_="vtitle") and card.find(class_="vtitle").get_text(strip=True)) or slug.replace("-", " ").title()
+                title = re.sub(r"^(VOOVI|ULLU|PrimePlay|Kooku):\s*(?:Watch\s+)?", "", title, flags=re.I).strip()
+                title = re.sub(r"\s*-\s*HDMaal.*$", "", title, flags=re.I).strip()
+
+                style = card.get("style", "")
+                m = re.search(r"url\(['\"]?([^'\"]+)['\"]?\)", style)
+                thumb = m.group(1) if m else None
+                if not thumb:
+                    img = card.find("img")
+                    thumb = img.get("src") or img.get("data-src") if img else None
+
+                dur_el = card.find(class_="time")
+                dur_text = dur_el.get_text(strip=True) if dur_el else ""
+
+                all_items.append({
+                    "id": slug,
+                    "service": "hdmaal",
+                    "name": sanitize(title) + ".mp4",
+                    "title": title,
+                    "url": href,
+                    "hdmaal_url": href,
+                    "thumbnail": thumb,
+                    "poster": thumb,
+                    "duration": dur_text,
+                    "user": creator_name,
+                    "file": {
+                        "path": href,
+                        "name": sanitize(title) + ".mp4"
+                    }
+                })
+
+            nav_prev = soup.find(class_=re.compile(r"nav-previous"))
+            if not nav_prev or not nav_prev.find("a"):
+                break
+
+        print(f"\n[OK] Fetched {len(all_items)} videos from HDMaal ({target}, pages {start_p}-{end_p}).")
+        return all_items
+    except Exception as e:
+        logger.error(f"Error scraping HDMaal listing for {target}: {e}")
+        return all_items
+    finally:
+        if close_client:
+            await client.aclose()
+
+async def resolve_hdmaal_direct_url(page_url: str, headers: dict = None, client: httpx.AsyncClient = None) -> tuple[str, str, dict]:
+    """Resolve an HDMaal post page URL to the direct CDN video URL and filename."""
+    clean = page_url.split("?")[0].lower()
+    if any(clean.endswith(ext) for ext in VIDEO_EXTENSIONS) and "hdmaal.movie" not in clean:
+        filename = unquote(Path(urlparse(page_url).path).name)
+        return page_url, sanitize(filename), {}
+
+    close_client = False
+    if client is None:
+        if headers is None:
+            headers = get_headers("hdmaal.movie", "https://hdmaal.movie/")
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+    try:
+        resp = await client.get(page_url)
+        resp.raise_for_status()
+        data = extract_hdmaal_post_data(resp.text, page_url)
+        direct_url = data.get("url") or page_url
+        filename = data.get("filename") or "video.mp4"
+        return direct_url, sanitize(filename), data
+    except Exception as e:
+        logger.error(f"Failed to resolve HDMaal post {page_url}: {e}")
+        return page_url, "video.mp4", {}
+    finally:
+        if close_client:
+            await client.aclose()
+
 def find_next_page_url(html: str, current_url: str, target_page_num: int) -> str | None:
     """Find the next page URL in HTML using pagination tags, rel='next', or URL pattern heuristics."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1122,6 +1818,20 @@ async def crawl_universal_page(target_url: str, page_range: tuple[int, int] | No
 
 async def fetch_all_posts(domain: str, service: str, user_id: str, page_range: tuple[int, int] | None = None, post_id: str = None) -> list[dict]:
     """Fetch all creator posts, optionally limited by range or single post ID."""
+    # 0. UXSeries
+    is_uxseries = (service == "uxseries" or "uxseries" in domain.lower())
+    if is_uxseries:
+        if post_id:
+            return await fetch_uxseries_post(domain, post_id)
+        return await fetch_uxseries_listing(domain, user_id, page_range)
+
+    # 1. HDMaal
+    is_hdmaal = (service == "hdmaal" or "hdmaal" in domain.lower())
+    if is_hdmaal:
+        if post_id:
+            return await fetch_hdmaal_post(domain, post_id)
+        return await fetch_hdmaal_listing(domain, user_id, page_range)
+
     # 1. Viralchut
     is_viralchut = (service == "viralchut" or "viralchut" in domain.lower())
     if is_viralchut:
@@ -1216,9 +1926,9 @@ def extract_video_urls(domain: str, posts: list[dict]) -> list[dict]:
         service = p.get("service", "")
         creator_id = p.get("user", "")
 
-        # Universal Web Videos (including Viralchut, direct media, and crawled items)
-        direct_url = p.get("url") or (p.get("file", {}).get("path") if str(p.get("file", {}).get("path", "")).startswith("http") else None) or p.get("viralchut_url")
-        if direct_url or p.get("service") in ("viralchut", "generic", "direct"):
+        # Universal Web Videos (including Viralchut, UXSeries, HDMaal, direct media, and crawled items)
+        direct_url = p.get("url") or (p.get("file", {}).get("path") if str(p.get("file", {}).get("path", "")).startswith("http") else None) or p.get("viralchut_url") or p.get("uxseries_url") or p.get("hdmaal_url")
+        if direct_url or p.get("service") in ("viralchut", "uxseries", "hdmaal", "generic", "direct"):
             url = direct_url or p.get("url")
             name = p.get("name") or (sanitize(post_title) + ".mp4")
             if url and url not in urls:
@@ -1231,6 +1941,9 @@ def extract_video_urls(domain: str, posts: list[dict]) -> list[dict]:
                     "content": post_content.strip()[:300],
                     "thumbnail": p.get("thumbnail") or p.get("poster"),
                     "poster": p.get("poster") or p.get("thumbnail"),
+                    "actors": p.get("actors", []),
+                    "platform": p.get("platform", ""),
+                    "duration": p.get("duration", ""),
                     "user": creator_id or p.get("user") or "web"
                 })
                 urls.add(url)
@@ -1289,8 +2002,12 @@ def sanitize(n: str) -> str:
 
 async def resolve_redirect_url(url: str, headers: dict) -> str:
     """Follow redirects to get the final CDN URL (e.g. n2.coomer.st)."""
+    if any(k in url.lower() for k in ["cdn.azmaal.com", "cdn.pmaal.com", "video.maalcdn.com"]):
+        return url
     try:
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=20) as c:
+        req_headers = dict(headers or {})
+        req_headers.setdefault("Range", "bytes=0-10")
+        async with httpx.AsyncClient(headers=req_headers, follow_redirects=True, timeout=15) as c:
             async with c.stream("GET", url) as resp:
                 return str(resp.url)
     except Exception as e:
@@ -1431,8 +2148,58 @@ async def resolve_media_stream_info(domain: str, video: dict, client: httpx.Asyn
     referer = f"https://{domain}/"
     headers = get_headers(domain, referer, is_media=True)
 
-    # 1. If Viralchut, resolve direct CDN URL if it's still a post page
-    if video.get("service") == "viralchut" or "viralchut" in domain.lower():
+    # 1. If UXSeries, resolve direct CDN URL if it's still an episode page
+    if video.get("service") == "uxseries" or "uxseries" in domain.lower():
+        raw_url = video.get("url") or video.get("uxseries_url")
+        if raw_url and "uxseries.co" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+            try:
+                direct_url, resolved_name, meta = await resolve_uxseries_direct_url(raw_url, client=client)
+                if direct_url:
+                    url = direct_url
+                    video["url"] = direct_url
+                    if resolved_name:
+                        video["name"] = sanitize(resolved_name)
+                    if meta.get("poster") and not video.get("thumbnail"):
+                        video["thumbnail"] = meta["poster"]
+                    if meta.get("title") and not video.get("title"):
+                        video["title"] = meta["title"]
+                    if meta.get("actors") and not video.get("actors"):
+                        video["actors"] = meta["actors"]
+                    logger.info(f"Resolved UXSeries direct video URL: {raw_url} -> {url[:60]}...")
+            except Exception as e:
+                logger.error(f"Failed to resolve UXSeries direct video URL for {raw_url}: {e}")
+                return {"status": "error_html", "error": str(e)}
+
+        headers["Referer"] = f"https://{domain}/"
+        headers["Accept"] = "*/*"
+
+    # 2. If HDMaal, resolve direct CDN URL if it's still a post page
+    elif video.get("service") == "hdmaal" or "hdmaal" in domain.lower():
+        raw_url = video.get("url") or video.get("hdmaal_url")
+        if raw_url and "hdmaal.movie" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+            try:
+                direct_url, resolved_name, meta = await resolve_hdmaal_direct_url(raw_url, client=client)
+                if direct_url:
+                    url = direct_url
+                    video["url"] = direct_url
+                    if resolved_name:
+                        video["name"] = sanitize(resolved_name)
+                    if meta.get("poster") and not video.get("thumbnail"):
+                        video["thumbnail"] = meta["poster"]
+                    if meta.get("title") and not video.get("title"):
+                        video["title"] = meta["title"]
+                    if meta.get("actors") and not video.get("actors"):
+                        video["actors"] = meta["actors"]
+                    logger.info(f"Resolved HDMaal direct video URL: {raw_url} -> {url[:60]}...")
+            except Exception as e:
+                logger.error(f"Failed to resolve HDMaal direct video URL for {raw_url}: {e}")
+                return {"status": "error_html", "error": str(e)}
+
+        headers["Referer"] = f"https://{domain}/"
+        headers["Accept"] = "*/*"
+
+    # 2. If Viralchut, resolve direct CDN URL if it's still a post page
+    elif video.get("service") == "viralchut" or "viralchut" in domain.lower():
         raw_url = video.get("url") or video.get("viralchut_url")
         if raw_url and "viralchut.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
             try:
@@ -1509,6 +2276,8 @@ async def resolve_media_stream_info(domain: str, video: dict, client: httpx.Asyn
     try:
         # Send lightweight stream request to inspect response headers without downloading body
         req_headers = headers.copy()
+        if "Range" not in req_headers:
+            req_headers["Range"] = "bytes=0-1024"
         if any(x in url.lower() for x in ["bunkr", "balbums", "cdn.cr"]):
             req_headers["Referer"] = BUNKR_DL_REFERER
             req_headers["Origin"] = "https://bunkr.cr"
@@ -1567,8 +2336,52 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
     
     headers = get_headers(domain, referer, is_media=True)
 
+    # If this is a UXSeries video, resolve direct CDN link if it's still an episode page
+    if video.get("service") == "uxseries" or "uxseries" in domain.lower():
+        raw_url = video.get("url") or video.get("uxseries_url")
+        if raw_url and "uxseries.co" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+            try:
+                direct_url, resolved_name, meta = await resolve_uxseries_direct_url(raw_url, client=client)
+                if direct_url:
+                    url = direct_url
+                    video["url"] = direct_url
+                    if resolved_name:
+                        video["name"] = sanitize(resolved_name)
+                        filepath = output_dir / f"{video['id']}_{video['name']}"
+                    if meta.get("poster") and not video.get("thumbnail"):
+                        video["thumbnail"] = meta["poster"]
+                    logger.info(f"Resolved UXSeries direct URL: {raw_url} -> {url[:60]}...")
+            except Exception as e:
+                logger.error(f"Failed to resolve UXSeries direct URL for {raw_url}: {e}")
+                return "error_html"
+
+        headers["Referer"] = f"https://{domain}/"
+        headers["Accept"] = "*/*"
+
+    # If this is an HDMaal video, resolve direct CDN link if it's still a post page
+    elif video.get("service") == "hdmaal" or "hdmaal" in domain.lower():
+        raw_url = video.get("url") or video.get("hdmaal_url")
+        if raw_url and "hdmaal.movie" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+            try:
+                direct_url, resolved_name, meta = await resolve_hdmaal_direct_url(raw_url, client=client)
+                if direct_url:
+                    url = direct_url
+                    video["url"] = direct_url
+                    if resolved_name:
+                        video["name"] = sanitize(resolved_name)
+                        filepath = output_dir / f"{video['id']}_{video['name']}"
+                    if meta.get("poster") and not video.get("thumbnail"):
+                        video["thumbnail"] = meta["poster"]
+                    logger.info(f"Resolved HDMaal direct URL: {raw_url} -> {url[:60]}...")
+            except Exception as e:
+                logger.error(f"Failed to resolve HDMaal direct URL for {raw_url}: {e}")
+                return "error_html"
+
+        headers["Referer"] = f"https://{domain}/"
+        headers["Accept"] = "*/*"
+
     # If this is a Viralchut video, resolve direct CDN link if it's still a post page
-    if video.get("service") == "viralchut" or "viralchut" in domain.lower():
+    elif video.get("service") == "viralchut" or "viralchut" in domain.lower():
         raw_url = video.get("url") or video.get("viralchut_url")
         if raw_url and "viralchut.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
             try:
