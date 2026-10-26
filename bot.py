@@ -964,6 +964,7 @@ async def start_handler(event):
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Welcome! I scrape, download, and archive media directly into Telegram storage with MTProto multi-chunk speeds.\n\n"
         "⚡ <b>Supported Sources:</b>\n"
+        "• <b>XMoviesForYou:</b> HD Videos, Studios, Pornstars, Categories, Playlists (<code>https://xmoviesforyou.com/</code>)\n"
         "• <b>UXSeries:</b> Actresses, Series, Episodes, Platforms (<code>https://uxseries.co/</code>)\n"
         "• <b>HDMaal:</b> Models, OTT, Web Series (<code>https://hdmaal.movie/</code>)\n"
         "• <b>Universal Web Scraper & Crawler:</b> Any website, tube, blog, gallery, or direct video\n"
@@ -1021,8 +1022,10 @@ async def callback_handler(event):
         await event.respond(
             "🔗 <b>Step 1: From Where?</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send the UXSeries, HDMaal, Viralchut, Coomer, or Bunkr URL you want to scrape.\n\n"
+            "Please send the XMoviesForYou, UXSeries, HDMaal, Viralchut, Coomer, or Bunkr URL you want to scrape.\n\n"
             "💡 <i>Examples:</i>\n"
+            "• <code>https://xmoviesforyou.com/page/7</code>\n"
+            "• <code>https://xmoviesforyou.com/devilsfilm-serena-sterling-deepthroat-diagnosis</code>\n"
             "• <code>https://uxseries.co/actress/bharti-jha/</code>\n"
             "• <code>https://hdmaal.movie/model/bharti-jha/</code>\n"
             "• <code>https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
@@ -1365,6 +1368,8 @@ async def message_handler(event):
                 await event.respond(
                     "❌ <b>Unsupported URL format.</b>\n"
                     "Supported formats:\n"
+                    "• <code>https://xmoviesforyou.com/page/7</code>\n"
+                    "• <code>https://xmoviesforyou.com/devilsfilm-serena-sterling-deepthroat-diagnosis</code>\n"
                     "• <code>https://uxseries.co/actress/bharti-jha/</code>\n"
                     "• <code>https://hdmaal.movie/model/bharti-jha/</code>\n"
                     "• <code>https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
@@ -1506,6 +1511,28 @@ async def hdmaal_command_handler(event):
         return
     asyncio.create_task(download_and_upload(event, url, page_range, STORAGE_CHANNEL_ID))
 
+@client.on(events.NewMessage(pattern=r"^/xmovies(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+async def xmovies_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    url = event.pattern_match.group(1)
+    page_range = event.pattern_match.group(2)
+    if not url:
+        await event.respond(
+            "🎬 <b>XMoviesForYou Scraper</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Scrape HD Videos, Studios, Pornstars, Categories & Playlists from XMoviesForYou!\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/xmovies https://xmoviesforyou.com/page/7</code>\n"
+            "• <code>/xmovies https://xmoviesforyou.com/page/7 7-8</code>\n"
+            "• <code>/xmovies https://xmoviesforyou.com/devilsfilm-serena-sterling-deepthroat-diagnosis</code>\n"
+            "• <code>/xmovies https://xmoviesforyou.com/studio/devilsfilm</code>\n"
+            "• <code>/xmovies https://xmoviesforyou.com/pornstar/serena-sterling</code>\n\n"
+            "Or simply paste any XMoviesForYou link directly into this chat!",
+            parse_mode='html'
+        )
+        return
+    asyncio.create_task(download_and_upload(event, url, page_range, STORAGE_CHANNEL_ID))
+
 @client.on(events.NewMessage(pattern=r"^/crawl(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def crawl_command_handler(event):
     if not await check_admin_or_notify(event): return
@@ -1599,6 +1626,7 @@ async def help_command_handler(event):
         "• /crawl [url] - 🕷️ Crawl & select videos from any webpage\n"
         "• /uxseries [url] - ✨ Quick UXSeries scraper\n"
         "• /hdmaal [url] - 🎬 Quick HDMaal scraper\n"
+        "• /xmovies [url] - 🎥 Quick XMoviesForYou scraper\n"
         "• /viralchut [url] - 🔥 Quick Viralchut scraper\n"
         "• /bunkr [url] - ⚡ Quick Bunkr scraper\n"
         "• /stats - 📊 Storage & bot stats\n"
@@ -1615,6 +1643,7 @@ async def set_bot_commands():
         BotCommand(command="start", description="🚀 Open main menu & status"),
         BotCommand(command="download", description="📥 Download from any URL"),
         BotCommand(command="crawl", description="🕷️ Crawl & select from any webpage"),
+        BotCommand(command="xmovies", description="🎥 Quick XMoviesForYou scraper"),
         BotCommand(command="uxseries", description="✨ Quick UXSeries scraper"),
         BotCommand(command="hdmaal", description="🎬 Quick HDMaal scraper"),
         BotCommand(command="viralchut", description="🔥 Quick Viralchut scraper"),

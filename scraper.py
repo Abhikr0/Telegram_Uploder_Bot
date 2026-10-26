@@ -72,6 +72,7 @@ def get_headers(domain=DEFAULT_DOMAIN, referer=None, is_media: bool = False):
     is_viralchut = any(x in domain.lower() for x in ["viralchut", "desibp"])
     is_uxseries = any(x in domain.lower() for x in ["uxseries", "azmaal"])
     is_hdmaal = any(x in domain.lower() for x in ["hdmaal", "pmaal", "maalcdn"])
+    is_xmovies = any(x in domain.lower() for x in ["xmoviesforyou", "eternalslumber", "bestcdnfree"])
     is_coomer = any(x in domain.lower() for x in ["coomer", "kemono"])
 
     if is_bunkr:
@@ -86,6 +87,9 @@ def get_headers(domain=DEFAULT_DOMAIN, referer=None, is_media: bool = False):
     elif is_hdmaal:
         accept_val = "*/*" if is_media else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         default_referer = "https://hdmaal.movie/"
+    elif is_xmovies:
+        accept_val = "*/*" if is_media else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        default_referer = "https://xmoviesforyou.com/"
     elif is_coomer:
         accept_val = "text/css" if not is_media else "*/*"
         default_referer = f"https://{domain}/"
@@ -101,10 +105,12 @@ def get_headers(domain=DEFAULT_DOMAIN, referer=None, is_media: bool = False):
         "Connection": "keep-alive",
         "Sec-Fetch-Dest": "video" if is_media else ("empty" if is_coomer else "document"),
         "Sec-Fetch-Mode": "navigate" if (not is_media and not is_coomer) else "cors",
-        "Sec-Fetch-Site": "cross-site" if (is_bunkr or is_viralchut or is_uxseries or is_hdmaal or not is_coomer) else "same-origin",
+        "Sec-Fetch-Site": "cross-site" if (is_bunkr or is_viralchut or is_uxseries or is_hdmaal or is_xmovies or not is_coomer) else "same-origin",
     }
     if is_bunkr:
         headers["Origin"] = "https://bunkr.cr"
+    elif is_xmovies:
+        headers["Origin"] = "https://xmoviesforyou.com"
     elif is_coomer:
         headers["Origin"] = f"https://{domain}"
     return headers
@@ -230,6 +236,46 @@ def parse_media_url(url: str) -> Tuple[Optional[str], Optional[str], Optional[st
         slug = clean_path.strip("/")
         if slug:
             return domain, "hdmaal", slug, slug
+
+    # 4. Support XMoviesForYou URLs (Studios, Pornstars, Categories, Tags, Pages, Search, Single Videos)
+    if "xmoviesforyou" in domain_lower:
+        if "s" in query_params or "q" in query_params:
+            q = (query_params.get("s") or query_params.get("q"))[0].strip()
+            return domain, "xmoviesforyou", f"search/{q}", None
+
+        # Studio: /studio/name or /studio/name?page=2
+        studio_match = re.match(r"^/studio/([^/?#]+)", clean_path)
+        if studio_match:
+            slug = studio_match.group(1)
+            return domain, "xmoviesforyou", f"studio/{slug}", None
+
+        # Pornstar: /pornstar/name
+        star_match = re.match(r"^/pornstar/([^/?#]+)", clean_path)
+        if star_match:
+            slug = star_match.group(1)
+            return domain, "xmoviesforyou", f"pornstar/{slug}", None
+
+        # Category: /category/name
+        cat_match = re.match(r"^/category/([^/?#]+)", clean_path)
+        if cat_match:
+            slug = cat_match.group(1)
+            return domain, "xmoviesforyou", f"category/{slug}", None
+
+        # Tag: /tag/name
+        tag_match = re.match(r"^/tag/([^/?#]+)", clean_path)
+        if tag_match:
+            slug = tag_match.group(1)
+            return domain, "xmoviesforyou", f"tag/{slug}", None
+
+        # Catalog / Latest / Pages: /page/\d+, /most-viewed, or root
+        if re.match(r"^/page/\d+", clean_path) or clean_path in ("", "/", "/most-viewed"):
+            sub = clean_path.strip("/") or "browse"
+            return domain, "xmoviesforyou", sub, None
+
+        # Single video post
+        slug = clean_path.strip("/")
+        if slug:
+            return domain, "xmoviesforyou", slug, slug
 
     # 2. Support Bunkr URLs (albums and single items across all mirrors)
     is_bunkr = any(x in domain_lower for x in ["bunkr", "balbums"])
@@ -1372,6 +1418,305 @@ async def resolve_hdmaal_direct_url(page_url: str, headers: dict = None, client:
         if close_client:
             await client.aclose()
 
+# ── XMoviesForYou Extractor & Stream Resolution ───────────────────────────────
+
+def extract_xmovies_post_data(html: str, page_url: str) -> dict:
+    """Extract metadata, direct CDN video URL, poster, and title from an XMoviesForYou post page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. JSON-LD VideoObject / BlogPosting Schema
+    schema_data = {}
+    for s in soup.find_all("script", type=re.compile(r"ld\+json", re.I)):
+        try:
+            j = json.loads(s.string)
+            graph = j.get("@graph", [j]) if isinstance(j, dict) else (j if isinstance(j, list) else [])
+            for item in graph:
+                if isinstance(item, dict) and item.get("@type") in ("VideoObject", "BlogPosting"):
+                    schema_data = item
+                    break
+            if schema_data:
+                break
+        except Exception:
+            pass
+
+    # 2. Title
+    title = ""
+    if schema_data.get("name") or schema_data.get("headline"):
+        title = (schema_data.get("name") or schema_data.get("headline")).strip()
+    if not title:
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            title = og_title["content"].strip()
+    if not title:
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text(strip=True)
+    if not title and soup.title:
+        title = soup.title.get_text(strip=True)
+
+    title = re.sub(r"\s*-\s*XMoviesForYou.*$", "", title, flags=re.I).strip()
+
+    # 3. Poster / Thumbnail
+    poster = None
+    if schema_data.get("image") or schema_data.get("thumbnailUrl"):
+        poster = schema_data.get("image") or schema_data.get("thumbnailUrl")
+    if not poster:
+        og_img = soup.find("meta", property="og:image")
+        if og_img and og_img.get("content"):
+            poster = og_img["content"].strip()
+    if not poster:
+        v_tag = soup.find("video")
+        if v_tag and v_tag.get("poster"):
+            poster = v_tag["poster"]
+
+    # 4. Taxonomy: Studios, Actors, Categories, Tags
+    studios = [a.get_text(strip=True).replace("movie_creation", "").strip() for a in soup.find_all("a", href=re.compile(r"^/studio/"))]
+    actors = [a.get_text(strip=True).replace("person", "").strip() for a in soup.find_all("a", href=re.compile(r"^/pornstar/"))]
+    categories = [a.get_text(strip=True).replace("category", "").strip() for a in soup.find_all("a", href=re.compile(r"^/category/"))]
+    tags = [a.get_text(strip=True).lstrip("#").strip() for a in soup.find_all("a", href=re.compile(r"^/tag/"))]
+
+    # 5. External mirrors (Streamtape, Mixdrop, Doodstream, etc.)
+    mirrors = {}
+    for a in soup.find_all("a", href=True):
+        txt = a.get_text(strip=True).replace("download", "").strip()
+        href = a["href"]
+        if any(k in txt.upper() for k in ["STREAMTAPE", "MIXDROP", "DOODSTREAM", "PLAYMOGO"]):
+            mirrors[txt] = href
+
+    # 6. Stream videoId and target
+    vid_match = re.search(r"const\s+videoId\s*=\s*['\"]([^'\"]+)['\"]", html)
+    target_match = re.search(r"const\s+target\s*=\s*['\"]([^'\"]+)['\"]", html)
+    video_id = vid_match.group(1) if vid_match else None
+    target = target_match.group(1) if target_match else "dedi_1"
+
+    slug = urlparse(page_url).path.strip("/").split("/")[-1]
+    filename = f"{title}.mp4" if title else f"xmovies_{slug}.mp4"
+
+    return {
+        "id": slug,
+        "title": title or slug,
+        "filename": filename,
+        "description": schema_data.get("description", ""),
+        "poster": poster,
+        "thumbnail": poster,
+        "video_id": video_id,
+        "target": target,
+        "studios": studios,
+        "studio": studios[0] if studios else None,
+        "actors": actors,
+        "categories": categories,
+        "tags": tags,
+        "mirrors": mirrors,
+        "date": schema_data.get("uploadDate") or schema_data.get("datePublished", "")
+    }
+
+async def fetch_xmovies_post(domain: str, post_id: str, client: httpx.AsyncClient = None) -> list[dict]:
+    """Fetch and parse a single XMoviesForYou post page, resolving stream URL via its stream API."""
+    url = f"https://{domain}/{post_id}" if not post_id.startswith("http") else post_id
+    headers = get_headers(domain, f"https://{domain}/")
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        data = extract_xmovies_post_data(resp.text, url)
+        
+        # Query stream API for direct m3u8
+        direct_stream_url = None
+        if data.get("video_id"):
+            vid_id = data["video_id"]
+            tgt = data.get("target") or "dedi_1"
+            api_url = f"https://{domain}/api/stream/{vid_id}?target={tgt}"
+            try:
+                s_resp = await client.get(api_url, headers={"Referer": url, "Accept": "application/json"})
+                if s_resp.status_code == 200:
+                    api_json = s_resp.json()
+                    direct_stream_url = api_json.get("url")
+            except Exception as se:
+                logger.warning(f"Failed to query stream API for {url}: {se}")
+
+        final_url = direct_stream_url or url
+        return [{
+            "id": data["id"],
+            "service": "xmoviesforyou",
+            "name": sanitize(data["filename"]),
+            "title": data["title"],
+            "content": data["description"][:300],
+            "url": final_url,
+            "xmovies_url": url,
+            "direct_stream_url": direct_stream_url,
+            "thumbnail": data["poster"],
+            "poster": data["poster"],
+            "actors": data.get("actors", []),
+            "studio": data.get("studio"),
+            "user": data.get("studio") or (data.get("actors") and data["actors"][0]) or "xmoviesforyou",
+            "categories": data.get("categories", []),
+            "tags": data.get("tags", []),
+            "mirrors": data.get("mirrors", {}),
+            "date": data.get("date", ""),
+            "file": {
+                "path": final_url,
+                "name": sanitize(data["filename"])
+            }
+        }]
+    except Exception as e:
+        logger.error(f"Failed to fetch XMovies post {post_id}: {e}")
+        return []
+    finally:
+        if close_client:
+            await client.aclose()
+
+async def fetch_xmovies_listing(domain: str, target: str, page_range: tuple[int, int] | None = None, client: httpx.AsyncClient = None) -> list[dict]:
+    """Fetch video items across pages from XMoviesForYou category, tag, studio, pornstar, page, or browse listing."""
+    all_items = []
+    headers = get_headers(domain, f"https://{domain}/")
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+
+    try:
+        clean_tgt = target.strip("/")
+        
+        # Determine base path and starting page
+        page_num_in_target = None
+        m_page = re.match(r"^page/(\d+)", clean_tgt)
+        if m_page:
+            page_num_in_target = int(m_page.group(1))
+            base_path = ""
+        else:
+            base_path = clean_tgt if clean_tgt not in ("browse", "latest", "home", "") else ""
+
+        def get_page_url(p: int) -> str:
+            if not base_path:
+                return f"https://{domain}/page/{p}" if p > 1 else f"https://{domain}/"
+            else:
+                sep = "&" if "?" in base_path else "?"
+                return f"https://{domain}/{base_path}{sep}page={p}" if p > 1 else f"https://{domain}/{base_path}"
+
+        start_p = page_num_in_target if page_num_in_target is not None else 1
+        end_p = page_num_in_target if page_num_in_target is not None else 50
+        if page_range:
+            start_p, end_p = page_range
+
+        creator_name = clean_tgt.split("/")[-1].replace("-", " ").title() if "/" in clean_tgt else clean_tgt.replace("-", " ").title()
+
+        seen_links = set()
+        for p in range(start_p, end_p + 1):
+            p_url = get_page_url(p)
+            p_resp = await client.get(p_url)
+            if p_resp.status_code != 200:
+                break
+            soup = BeautifulSoup(p_resp.text, "html.parser")
+
+            cards = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if not href.startswith("/") or href in ["/", "#", "#downloads"] or any(href.startswith(x) for x in [
+                    "/page/", "/pages/", "/category/", "/categories/", "/tag/", "/tags/", "/pornstar/", "/pornstars/",
+                    "/studio/", "/studios/", "/pictures", "/live", "/cdn-cgi", "/dist", "/most-viewed"
+                ]):
+                    continue
+                h3 = a.find("h3")
+                img = a.find("img")
+                if h3 or img:
+                    cards.append(a)
+
+            if not cards:
+                break
+
+            for card in cards:
+                href = card["href"]
+                if href in seen_links:
+                    continue
+                seen_links.add(href)
+
+                slug = href.strip("/").split("/")[-1]
+                h3 = card.find("h3")
+                img = card.find("img")
+                title = h3.get_text(strip=True) if h3 else (img.get("alt", "").strip() if img else slug.replace("-", " ").title())
+                title = re.sub(r"\s*-\s*XMoviesForYou.*$", "", title, flags=re.I).strip()
+
+                thumb = img.get("src") if img else None
+                studio_el = card.select_one("span.text-primary")
+                studio = studio_el.get_text(strip=True) if studio_el else None
+
+                all_items.append({
+                    "id": slug,
+                    "service": "xmoviesforyou",
+                    "name": sanitize(title) + ".mp4",
+                    "title": title,
+                    "url": f"https://{domain}/{slug}",
+                    "xmovies_url": f"https://{domain}/{slug}",
+                    "thumbnail": thumb,
+                    "poster": thumb,
+                    "studio": studio,
+                    "user": studio or creator_name,
+                    "file": {
+                        "path": f"https://{domain}/{slug}",
+                        "name": sanitize(title) + ".mp4"
+                    }
+                })
+
+            has_next = any("Next" in a.get_text(strip=True) or f"page={p+1}" in a["href"] or f"/page/{p+1}" in a["href"] for a in soup.find_all("a", href=True))
+            if not has_next:
+                break
+
+        print(f"\n[OK] Fetched {len(all_items)} videos from XMoviesForYou ({target}, pages {start_p}-{end_p}).")
+        return all_items
+    except Exception as e:
+        logger.error(f"Error scraping XMovies listing for {target}: {e}")
+        return all_items
+    finally:
+        if close_client:
+            await client.aclose()
+
+async def resolve_xmovies_direct_url(page_url: str, headers: dict = None, client: httpx.AsyncClient = None) -> tuple[str, str, dict]:
+    """Resolve an XMoviesForYou post page URL to the direct CDN m3u8 video URL and metadata."""
+    clean = page_url.split("?")[0].lower()
+    if any(clean.endswith(ext) for ext in VIDEO_EXTENSIONS) and "xmoviesforyou.com" not in clean:
+        filename = unquote(Path(urlparse(page_url).path).name)
+        return page_url, sanitize(filename), {}
+
+    close_client = False
+    if client is None:
+        if headers is None:
+            headers = get_headers("xmoviesforyou.com", "https://xmoviesforyou.com/")
+        client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30)
+        close_client = True
+    try:
+        resp = await client.get(page_url)
+        resp.raise_for_status()
+        data = extract_xmovies_post_data(resp.text, page_url)
+        
+        direct_stream_url = None
+        if data.get("video_id"):
+            vid_id = data["video_id"]
+            tgt = data.get("target") or "dedi_1"
+            api_url = f"https://xmoviesforyou.com/api/stream/{vid_id}?target={tgt}"
+            try:
+                s_resp = await client.get(api_url, headers={"Referer": page_url, "Accept": "application/json"})
+                if s_resp.status_code == 200:
+                    api_json = s_resp.json()
+                    direct_stream_url = api_json.get("url")
+            except Exception as se:
+                logger.warning(f"Failed to query stream API in resolve_xmovies_direct_url: {se}")
+
+        direct_url = direct_stream_url or page_url
+        filename = data.get("filename") or "video.mp4"
+        data["url"] = direct_url
+        return direct_url, sanitize(filename), data
+    except Exception as e:
+        logger.error(f"Failed to resolve XMovies post {page_url}: {e}")
+        return page_url, "video.mp4", {}
+    finally:
+        if close_client:
+            await client.aclose()
+
 def find_next_page_url(html: str, current_url: str, target_page_num: int) -> str | None:
     """Find the next page URL in HTML using pagination tags, rel='next', or URL pattern heuristics."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1832,6 +2177,13 @@ async def fetch_all_posts(domain: str, service: str, user_id: str, page_range: t
             return await fetch_hdmaal_post(domain, post_id)
         return await fetch_hdmaal_listing(domain, user_id, page_range)
 
+    # 1. XMoviesForYou
+    is_xmovies = (service == "xmoviesforyou" or "xmoviesforyou" in domain.lower())
+    if is_xmovies:
+        if post_id:
+            return await fetch_xmovies_post(domain, post_id)
+        return await fetch_xmovies_listing(domain, user_id, page_range)
+
     # 1. Viralchut
     is_viralchut = (service == "viralchut" or "viralchut" in domain.lower())
     if is_viralchut:
@@ -1926,9 +2278,9 @@ def extract_video_urls(domain: str, posts: list[dict]) -> list[dict]:
         service = p.get("service", "")
         creator_id = p.get("user", "")
 
-        # Universal Web Videos (including Viralchut, UXSeries, HDMaal, direct media, and crawled items)
-        direct_url = p.get("url") or (p.get("file", {}).get("path") if str(p.get("file", {}).get("path", "")).startswith("http") else None) or p.get("viralchut_url") or p.get("uxseries_url") or p.get("hdmaal_url")
-        if direct_url or p.get("service") in ("viralchut", "uxseries", "hdmaal", "generic", "direct"):
+        # Universal Web Videos (including Viralchut, UXSeries, HDMaal, XMoviesForYou, direct media, and crawled items)
+        direct_url = p.get("url") or (p.get("file", {}).get("path") if str(p.get("file", {}).get("path", "")).startswith("http") else None) or p.get("viralchut_url") or p.get("uxseries_url") or p.get("hdmaal_url") or p.get("xmovies_url")
+        if direct_url or p.get("service") in ("viralchut", "uxseries", "hdmaal", "xmoviesforyou", "generic", "direct"):
             url = direct_url or p.get("url")
             name = p.get("name") or (sanitize(post_title) + ".mp4")
             if url and url not in urls:
@@ -2198,6 +2550,34 @@ async def resolve_media_stream_info(domain: str, video: dict, client: httpx.Asyn
         headers["Referer"] = f"https://{domain}/"
         headers["Accept"] = "*/*"
 
+    # 2. If XMoviesForYou, resolve direct stream m3u8 URL if it's still a post page
+    elif video.get("service") == "xmoviesforyou" or "xmoviesforyou" in domain.lower():
+        raw_url = video.get("url") or video.get("xmovies_url")
+        if raw_url and "xmoviesforyou.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in STREAM_EXTENSIONS):
+            try:
+                direct_url, resolved_name, meta = await resolve_xmovies_direct_url(raw_url, client=client)
+                if direct_url:
+                    url = direct_url
+                    video["url"] = direct_url
+                    if resolved_name:
+                        video["name"] = sanitize(resolved_name)
+                    if meta.get("poster") and not video.get("thumbnail"):
+                        video["thumbnail"] = meta["poster"]
+                    if meta.get("title") and not video.get("title"):
+                        video["title"] = meta["title"]
+                    if meta.get("actors") and not video.get("actors"):
+                        video["actors"] = meta["actors"]
+                    if meta.get("studio") and not video.get("studio"):
+                        video["studio"] = meta["studio"]
+                    logger.info(f"Resolved XMovies direct video URL: {raw_url} -> {url[:60]}...")
+            except Exception as e:
+                logger.error(f"Failed to resolve XMovies direct video URL for {raw_url}: {e}")
+                return {"status": "error_html", "error": str(e)}
+
+        headers["Referer"] = raw_url or f"https://{domain}/"
+        headers["Origin"] = f"https://{domain}"
+        headers["Accept"] = "*/*"
+
     # 2. If Viralchut, resolve direct CDN URL if it's still a post page
     elif video.get("service") == "viralchut" or "viralchut" in domain.lower():
         raw_url = video.get("url") or video.get("viralchut_url")
@@ -2380,6 +2760,29 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
         headers["Referer"] = f"https://{domain}/"
         headers["Accept"] = "*/*"
 
+    # If this is an XMoviesForYou video, resolve direct CDN link if it's still a post page
+    elif video.get("service") == "xmoviesforyou" or "xmoviesforyou" in domain.lower():
+        raw_url = video.get("url") or video.get("xmovies_url")
+        if raw_url and "xmoviesforyou.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in STREAM_EXTENSIONS):
+            try:
+                direct_url, resolved_name, meta = await resolve_xmovies_direct_url(raw_url, client=client)
+                if direct_url:
+                    url = direct_url
+                    video["url"] = direct_url
+                    if resolved_name:
+                        video["name"] = sanitize(resolved_name)
+                        filepath = output_dir / f"{video['id']}_{video['name']}"
+                    if meta.get("poster") and not video.get("thumbnail"):
+                        video["thumbnail"] = meta["poster"]
+                    logger.info(f"Resolved XMovies direct URL: {raw_url} -> {url[:60]}...")
+            except Exception as e:
+                logger.error(f"Failed to resolve XMovies direct URL for {raw_url}: {e}")
+                return "error_html"
+
+        headers["Referer"] = raw_url or f"https://{domain}/"
+        headers["Origin"] = f"https://{domain}"
+        headers["Accept"] = "*/*"
+
     # If this is a Viralchut video, resolve direct CDN link if it's still a post page
     elif video.get("service") == "viralchut" or "viralchut" in domain.lower():
         raw_url = video.get("url") or video.get("viralchut_url")
@@ -2464,6 +2867,7 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
                     'overwrites': True,
                     'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                     'progress_hooks': [_hook],
+                    'http_headers': headers,
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
@@ -2615,7 +3019,7 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 async def amain():
-    parser = argparse.ArgumentParser(description="🎬 Enhanced Coomer.st Scraper (Async)")
+    parser = argparse.ArgumentParser(description="🎬 Multi-Source Video & Media Scraper (Async)")
     parser.add_argument("--url", "-u", help="Profile URL")
     parser.add_argument("--pages", "-p", help="Page range (e.g. 1-3)")
     parser.add_argument("--output", "-o", help="Output directory")
@@ -2651,8 +3055,11 @@ async def amain():
             print(f"   [{c.get('service')}] {c.get('name')} -> https://{domain}/{c['service']}/user/{c['id']}")
         return
 
-    if not args.pages:
-        args.pages = input("📄 Enter page range (e.g., 1-3, 5, or leave blank for all): ").strip() or None
+    if not args.pages and sys.stdin.isatty():
+        try:
+            args.pages = input("📄 Enter page range (e.g., 1-3, 5, or leave blank for all): ").strip() or None
+        except (EOFError, KeyboardInterrupt):
+            args.pages = None
 
     domain, service, user_id, post_id = parse_media_url(args.url)
     if not domain: return
