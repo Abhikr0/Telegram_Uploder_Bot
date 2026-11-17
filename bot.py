@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import asyncio
 import logging
 import shutil
@@ -172,11 +173,83 @@ async def get_chat_title_cached(chat_id):
     except Exception:
         return str(chat_id)
 
+FORUM_TOPICS_FILE = Path(__file__).parent / "forum_topics.json"
+
+def load_forum_topics():
+    if not FORUM_TOPICS_FILE.exists():
+        return {}
+    try:
+        with open(FORUM_TOPICS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading forum_topics.json: {e}")
+        return {}
+
+def save_forum_topic(chat_id, topic_id, title):
+    if not chat_id or not topic_id:
+        return
+    data = load_forum_topics()
+    cid_str = str(chat_id)
+    if cid_str not in data:
+        data[cid_str] = {}
+    data[cid_str][str(topic_id)] = {
+        "id": int(topic_id),
+        "title": str(title).strip() or f"Topic #{topic_id}",
+        "updated_at": int(time.time())
+    }
+    try:
+        with open(FORUM_TOPICS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Error saving forum_topics.json: {e}")
+
+def delete_forum_topic(chat_id, topic_id):
+    data = load_forum_topics()
+    cid_str = str(chat_id)
+    if cid_str in data and str(topic_id) in data[cid_str]:
+        del data[cid_str][str(topic_id)]
+        try:
+            with open(FORUM_TOPICS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+async def discover_topics_from_chat(chat_id):
+    """
+    Attempts to discover topic creation messages from recent message IDs in the group.
+    In Telegram forum supergroups, topic creation emits a message with MessageActionTopicCreate.
+    """
+    if not chat_id:
+        return []
+    discovered = []
+    try:
+        cid = int(chat_id)
+        ids_to_check = list(range(1, 60))
+        msgs = await client.get_messages(cid, ids=ids_to_check)
+        for m in msgs:
+            if not m:
+                continue
+            action = getattr(m, 'action', None)
+            if isinstance(action, types.MessageActionTopicCreate):
+                save_forum_topic(cid, m.id, action.title)
+                discovered.append({'id': m.id, 'title': action.title})
+            elif getattr(m, 'reply_to', None) and getattr(m.reply_to, 'forum_topic', False):
+                top_id = getattr(m.reply_to, 'reply_to_top_id', None) or getattr(m.reply_to, 'reply_to_msg_id', None)
+                if top_id and str(top_id) not in load_forum_topics().get(str(cid), {}):
+                    save_forum_topic(cid, top_id, f"Topic #{top_id}")
+                    discovered.append({'id': top_id, 'title': f"Topic #{top_id}"})
+    except Exception as e:
+        logger.debug(f"Topic discovery scan error for {chat_id}: {e}")
+    return discovered
+
 async def get_forum_topics_list(chat_id, limit=40):
     if not chat_id:
         return []
+    cid = int(chat_id)
+    cid_str = str(cid)
+
+    # 1. MTProto GetForumTopicsRequest (works on user accounts, raises BotMethodInvalidError on bots)
     try:
-        cid = int(chat_id)
         entity = await client.get_entity(cid)
         res = await client(GetForumTopicsRequest(
             peer=entity,
@@ -185,28 +258,76 @@ async def get_forum_topics_list(chat_id, limit=40):
             offset_topic=0,
             limit=limit
         ))
-        topics = []
+        mtproto_topics = []
         for t in getattr(res, 'topics', []):
             if isinstance(t, types.ForumTopic):
-                topics.append({
+                mtproto_topics.append({
                     'id': t.id,
                     'title': t.title,
                     'closed': bool(getattr(t, 'closed', False))
                 })
-        return topics
+                save_forum_topic(cid, t.id, t.title)
+        if mtproto_topics:
+            return mtproto_topics
     except Exception as e:
-        logger.warning(f"Could not fetch topics for {chat_id}: {e}")
-        return []
+        # Standard Telegram restriction: Bots are not allowed to call GetForumTopicsRequest
+        logger.debug(f"MTProto GetForumTopicsRequest unavailable for bot on {chat_id}: {e}")
+
+    # 2. Check local persistent store
+    all_stored = load_forum_topics().get(cid_str, {})
+    if not all_stored:
+        # Try active discovery from recent group messages
+        await discover_topics_from_chat(cid)
+        all_stored = load_forum_topics().get(cid_str, {})
+
+    topics = []
+    for tid_str, tinfo in all_stored.items():
+        topics.append({
+            'id': int(tid_str),
+            'title': tinfo.get('title', f"Topic #{tid_str}"),
+            'closed': bool(tinfo.get('closed', False))
+        })
+
+    # Sort with newest topic first
+    topics.sort(key=lambda x: x['id'], reverse=True)
+    return topics[:limit]
 
 async def create_forum_topic_helper(chat_id, title):
     if not chat_id or not title:
         return None
+    cid = int(chat_id)
+    clean_title = title.strip()[:128]
+    # First: use official Telegram Bot API HTTP endpoint (recommended for bots)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http_client:
+            resp = await http_client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
+                json={"chat_id": cid, "name": clean_title}
+            )
+            data = resp.json()
+            if data.get("ok"):
+                topic_id = data["result"]["message_thread_id"]
+                logger.info(f"Created forum topic '{clean_title}' via Bot API (ID: {topic_id})")
+                save_forum_topic(cid, topic_id, clean_title)
+                return topic_id
+            else:
+                desc = data.get("description", "")
+                if "not enough rights" in desc.lower():
+                    raise Exception(
+                        "Bot lacks 'Manage Topics' admin permission in this group. "
+                        "Please go to Group Settings > Administrators > Infinty > toggle 'Manage Topics' ON and tap Save."
+                    )
+                logger.warning(f"Bot API createForumTopic returned error: {desc}")
+    except Exception as e:
+        if "lacks 'Manage Topics'" in str(e):
+            raise e
+        logger.debug(f"HTTP createForumTopic failed, trying MTProto: {e}")
+
+    # Fallback: MTProto
     try:
         import random
-        cid = int(chat_id)
         entity = await client.get_entity(cid)
         rnd_id = random.randint(0, 0x7fffffffffffffff)
-        clean_title = title.strip()[:128]
         result = await client(CreateForumTopicRequest(
             peer=entity,
             title=clean_title,
@@ -230,18 +351,16 @@ async def create_forum_topic_helper(chat_id, title):
         elif hasattr(result, 'id'):
             topic_id = result.id
 
-        if not topic_id:
-            latest = await get_forum_topics_list(cid, limit=5)
-            for t in latest:
-                if t['title'] == clean_title:
-                    topic_id = t['id']
-                    break
-            if not topic_id and latest:
-                topic_id = latest[0]['id']
-
+        if topic_id:
+            save_forum_topic(cid, topic_id, clean_title)
         return topic_id
     except Exception as e:
         logger.error(f"Error creating topic '{title}' in {chat_id}: {e}")
+        if "can't write" in str(e).lower() or "rights" in str(e).lower():
+            raise Exception(
+                "Bot lacks 'Manage Topics' admin permission in this group. "
+                "Please go to Group Settings > Administrators > Infinty > toggle 'Manage Topics' ON and tap Save."
+            )
         raise e
 
 def format_bytes(size_bytes: int) -> str:
@@ -761,7 +880,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     return
 
                 stream_url = info["url"]
-                stream_headers = info["headers"]
+                stream_headers = {k: v for k, v in info.get("headers", {}).items() if k.lower() != "range"}
                 file_size = info["file_size"]
                 stream_filename = info.get("name") or f"{vid['id']}_{vid_name}"
 
@@ -1491,16 +1610,18 @@ async def callback_handler(event):
         topics = await get_forum_topics_list(dest_id, limit=50)
         if not topics:
             await event.edit(
-                "⚠️ <b>No Topics Found or Bot Lacks Permission</b>\n"
+                "⚠️ <b>No Topics Found in this Group</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "Could not fetch topics list. Make sure the bot is an Admin with 'Manage Topics' permission in the group.\n\n"
-                "You can still create a new topic, enter Topic ID manually, or upload to General chat.",
+                f"No saved topics yet for group <code>{dest_id}</code>.\n\n"
+                "• Tap <b>➕ Create New Topic</b> to have the bot create one.\n"
+                "• Tap <b>🔢 Enter Topic ID</b> to enter an existing topic ID.\n"
+                "• Or run <code>/addtopic &lt;id&gt; &lt;name&gt;</code>.",
                 parse_mode='html',
                 buttons=[
                     [Button.inline("➕ Create New Topic", b"topic_create")],
                     [Button.inline("🔢 Enter Topic ID Manually", b"topic_manual")],
                     [Button.inline("💬 General / Main Chat", b"topic_general")],
-                    [Button.inline("🔙 Back", b"dest_default_topic")]
+                    [Button.inline("🔙 Back", f"dest_topic_pick:{dest_id}".encode())]
                 ]
             )
             await event.answer()
@@ -1546,9 +1667,11 @@ async def callback_handler(event):
         if user_id not in USER_STATES:
             await event.answer("Session expired. Please start again.", alert=True)
             return
-        parts = data.split(":")
+        parts = data.split(":", 2)
         topic_id = int(parts[1])
-        topic_title = parts[2] if len(parts) > 2 else f"ID {topic_id}"
+        dest_id = USER_STATES[user_id].get('dest', STORAGE_CHANNEL_ID)
+        stored_title = load_forum_topics().get(str(dest_id), {}).get(str(topic_id), {}).get('title')
+        topic_title = stored_title or (parts[2] if len(parts) > 2 else f"ID {topic_id}")
         USER_STATES[user_id]['topic_id'] = topic_id
         USER_STATES[user_id]['topic_title'] = topic_title
         await event.edit(f"✅ Selected Topic: <b>{topic_title}</b> (ID: <code>{topic_id}</code>).\nStarting upload...", parse_mode='html')
@@ -1665,12 +1788,24 @@ async def message_handler(event):
 
         elif state == 'WAITING_TOPIC_ID':
             try:
-                topic_id = int(text.strip())
+                raw_parts = text.strip().split(maxsplit=1)
+                topic_id = int(raw_parts[0])
+                dest_id = USER_STATES[user_id].get('dest', STORAGE_CHANNEL_ID)
+                if len(raw_parts) > 1 and raw_parts[1].strip():
+                    topic_title = raw_parts[1].strip()
+                else:
+                    stored = load_forum_topics().get(str(dest_id), {}).get(str(topic_id))
+                    if stored and stored.get('title'):
+                        topic_title = stored['title']
+                    else:
+                        topic_title = f"Topic #{topic_id}"
+                save_forum_topic(dest_id, topic_id, topic_title)
                 USER_STATES[user_id]['topic_id'] = topic_id
-                USER_STATES[user_id]['topic_title'] = f"Topic #{topic_id}"
+                USER_STATES[user_id]['topic_title'] = topic_title
+                await event.respond(f"✅ Selected Topic: <b>{topic_title}</b> (ID: <code>{topic_id}</code>).\nStarting upload...", parse_mode='html')
                 await start_confirmed_download(event, user_id)
             except ValueError:
-                await event.respond("❌ <b>Invalid ID.</b>\nPlease send a valid numeric Topic ID.", parse_mode='html')
+                await event.respond("❌ <b>Invalid ID.</b>\nPlease send a valid numeric Topic ID (e.g. <code>8</code> or <code>8 My Topic</code>).", parse_mode='html')
     else:
         # Direct URL pasting support without pressing buttons first
         if text.startswith('http://') or text.startswith('https://'):
@@ -2036,7 +2171,7 @@ async def newtopic_command_handler(event):
     if not title:
         await event.respond(
             "ℹ️ <b>Usage:</b> <code>/newtopic &lt;Title&gt;</code>\n\n"
-            "Creates a new forum topic in your default group (<code>STORAGE_CHANNEL_ID</code>).\n"
+            "Creates a new forum topic in your forum group.\n"
             "<i>Example:</i> <code>/newtopic Serena Sterling</code>",
             parse_mode='html'
         )
@@ -2045,11 +2180,17 @@ async def newtopic_command_handler(event):
     dest_id = STORAGE_CHANNEL_ID
     if event.is_group:
         dest_id = event.chat_id
+    else:
+        for c in STORAGE_CHANNELS:
+            if await is_forum_chat(c):
+                dest_id = c
+                break
 
     status_m = await event.respond(f"⏳ Creating topic <b>{title}</b> in group <code>{dest_id}</code>...", parse_mode='html')
     try:
         topic_id = await create_forum_topic_helper(dest_id, title)
         if topic_id:
+            save_forum_topic(dest_id, topic_id, title)
             clean_id = str(abs(dest_id))
             if clean_id.startswith("100"): clean_id = clean_id[3:]
             topic_link = f"https://t.me/c/{clean_id}/{topic_id}"
@@ -2059,7 +2200,8 @@ async def newtopic_command_handler(event):
                 f"• <b>Title:</b> {title}\n"
                 f"• <b>Topic ID:</b> <code>{topic_id}</code>\n"
                 f"• <b>Group:</b> <code>{dest_id}</code>\n"
-                f"• <b>Link:</b> <a href=\"{topic_link}\">Open Topic</a>",
+                f"• <b>Link:</b> <a href=\"{topic_link}\">Open Topic</a>\n\n"
+                "Saved! It will now appear in 📑 <b>Choose Existing Topic</b>.",
                 parse_mode='html'
             )
         else:
@@ -2071,37 +2213,112 @@ async def newtopic_command_handler(event):
             parse_mode='html'
         )
 
+@client.on(events.NewMessage(pattern=r"^/addtopic(?:@\S+)?(?:\s+(\d+)(?:\s+(.+))?)?$"))
+async def addtopic_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    topic_id_str = event.pattern_match.group(1)
+    topic_title = event.pattern_match.group(2)
+    if not topic_id_str:
+        await event.respond(
+            "ℹ️ <b>Usage:</b> <code>/addtopic &lt;Topic_ID&gt; [Title]</code>\n\n"
+            "Registers an existing forum topic so it appears in the bot's topic selector.\n"
+            "<i>Example:</i> <code>/addtopic 8 Charli O</code>",
+            parse_mode='html'
+        )
+        return
+
+    topic_id = int(topic_id_str)
+    topic_title = topic_title.strip() if topic_title else f"Topic #{topic_id}"
+    dest_id = event.chat_id if event.is_group else STORAGE_CHANNEL_ID
+    if not event.is_group:
+        for c in STORAGE_CHANNELS:
+            if await is_forum_chat(c):
+                dest_id = c
+                break
+
+    save_forum_topic(dest_id, topic_id, topic_title)
+    await event.respond(
+        f"✅ <b>Topic Registered!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Group:</b> <code>{dest_id}</code>\n"
+        f"• <b>Topic ID:</b> <code>{topic_id}</code>\n"
+        f"• <b>Title:</b> {topic_title}\n\n"
+        "It will now appear in the 📑 <b>Choose Existing Topic</b> menu!",
+        parse_mode='html'
+    )
+
+@client.on(events.NewMessage(pattern=r"^/deltopic(?:@\S+)?(?:\s+(\d+))?$"))
+async def deltopic_command_handler(event):
+    if not await check_admin_or_notify(event): return
+    topic_id_str = event.pattern_match.group(1)
+    if not topic_id_str:
+        await event.respond(
+            "ℹ️ <b>Usage:</b> <code>/deltopic &lt;Topic_ID&gt;</code>\n\n"
+            "Removes a topic from the bot's selector list.\n"
+            "<i>Example:</i> <code>/deltopic 8</code>",
+            parse_mode='html'
+        )
+        return
+
+    topic_id = int(topic_id_str)
+    dest_id = event.chat_id if event.is_group else STORAGE_CHANNEL_ID
+    if not event.is_group:
+        for c in STORAGE_CHANNELS:
+            if await is_forum_chat(c):
+                dest_id = c
+                break
+
+    delete_forum_topic(dest_id, topic_id)
+    await event.respond(
+        f"🗑️ Removed Topic ID <code>{topic_id}</code> from group <code>{dest_id}</code>.",
+        parse_mode='html'
+    )
+
 @client.on(events.NewMessage(pattern=r"^/topics(?:@\S+)?$"))
 async def topics_command_handler(event):
     if not await check_admin_or_notify(event): return
     dest_id = STORAGE_CHANNEL_ID
     if event.is_group:
         dest_id = event.chat_id
+    else:
+        for c in STORAGE_CHANNELS:
+            if await is_forum_chat(c):
+                dest_id = c
+                break
 
     status_m = await event.respond(f"⏳ Fetching topics from group <code>{dest_id}</code>...", parse_mode='html')
     try:
         topics = await get_forum_topics_list(dest_id, limit=30)
         if not topics:
             await status_m.edit(
-                f"⚠️ <b>No topics found or bot lacks permission</b> in group <code>{dest_id}</code>.\n"
-                "Ensure Topics are enabled in group settings and the bot is an Admin.",
+                f"⚠️ <b>No topics found for group <code>{dest_id}</code>.</b>\n\n"
+                "• Use <code>/addtopic &lt;id&gt; &lt;name&gt;</code> to register an existing topic.\n"
+                "• Or use <code>/newtopic &lt;title&gt;</code> to create a new one.\n"
+                "• Or talk in that topic in the group so the bot auto-registers it!",
                 parse_mode='html'
             )
             return
 
-        text = (
-            f"📑 <b>Active Forum Topics in <code>{dest_id}</code>:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        )
+        chat_name = await get_chat_title_cached(dest_id)
         clean_id = str(abs(dest_id))
         if clean_id.startswith("100"): clean_id = clean_id[3:]
+
+        text = (
+            f"📑 <b>Forum Topics in {chat_name} (<code>{dest_id}</code>):</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
 
         for t in topics:
             link = f"https://t.me/c/{clean_id}/{t['id']}"
             status = "🔒 Closed" if t.get('closed') else "🟢 Active"
             text += f"• <a href=\"{link}\"><b>{t['title']}</b></a> (ID: <code>{t['id']}</code>) - {status}\n"
 
-        text += "\n💡 <i>To upload to a topic, select it during download setup or use its ID.</i>"
+        text += (
+            "\n💡 <i>Commands:</i>\n"
+            "• <code>/addtopic &lt;id&gt; &lt;title&gt;</code> - Register existing topic\n"
+            "• <code>/newtopic &lt;title&gt;</code> - Create new topic\n"
+            "• <code>/deltopic &lt;id&gt;</code> - Remove from list"
+        )
         await status_m.edit(text, parse_mode='html')
     except Exception as e:
         await status_m.edit(f"❌ <b>Error fetching topics:</b> <code>{e}</code>", parse_mode='html')
@@ -2119,6 +2336,10 @@ async def id_command_handler(event):
     topic_id = None
     if reply_to:
         topic_id = getattr(reply_to, 'reply_to_top_id', None) or getattr(reply_to, 'reply_to_msg_id', None)
+        if topic_id and is_group and is_forum:
+            stored = load_forum_topics().get(str(chat_id), {})
+            if str(topic_id) not in stored:
+                save_forum_topic(chat_id, topic_id, f"Topic #{topic_id}")
 
     text = (
         "🆔 <b>Chat & ID Information</b>\n"
@@ -2137,6 +2358,25 @@ async def id_command_handler(event):
     )
     await event.respond(text, parse_mode='html')
 
+@client.on(events.NewMessage())
+async def auto_track_topics_in_groups(event):
+    if not event.is_group:
+        return
+    chat_id = event.chat_id
+    action = getattr(event.message, 'action', None)
+    if isinstance(action, types.MessageActionTopicCreate):
+        save_forum_topic(chat_id, event.message.id, action.title)
+        logger.info(f"Auto-saved forum topic in {chat_id}: '{action.title}' (ID: {event.message.id})")
+    elif isinstance(action, types.MessageActionTopicEdit):
+        if getattr(action, 'title', None):
+            save_forum_topic(chat_id, event.message.id, action.title)
+    elif getattr(event.message, 'reply_to', None) and getattr(event.message.reply_to, 'forum_topic', False):
+        top_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
+        if top_id:
+            stored = load_forum_topics().get(str(chat_id), {})
+            if str(top_id) not in stored:
+                save_forum_topic(chat_id, top_id, f"Topic #{top_id}")
+
 @client.on(events.NewMessage(pattern=r"^/help$"))
 async def help_command_handler(event):
     if not await check_admin_or_notify(event): return
@@ -2148,6 +2388,8 @@ async def help_command_handler(event):
         "• /download [url] - 📥 Download all items\n"
         "• /crawl [url] - 🕷️ Crawl & select videos from any webpage\n"
         "• /newtopic &lt;title&gt; - ➕ Create a new forum topic in group\n"
+        "• /addtopic &lt;id&gt; [title] - 📌 Register an existing topic in group\n"
+        "• /deltopic &lt;id&gt; - 🗑️ Remove topic from list\n"
         "• /topics - 📑 List active forum topics in group\n"
         "• /id - 🆔 Get chat ID, topic ID & user ID\n"
         "• /uxseries [url] - ✨ Quick UXSeries scraper\n"
@@ -2170,6 +2412,8 @@ async def set_bot_commands():
         BotCommand(command="download", description="📥 Download from any URL"),
         BotCommand(command="crawl", description="🕷️ Crawl & select from any webpage"),
         BotCommand(command="newtopic", description="➕ Create a new topic in group"),
+        BotCommand(command="addtopic", description="📌 Register an existing topic in group"),
+        BotCommand(command="deltopic", description="🗑️ Remove topic from list"),
         BotCommand(command="topics", description="📑 List forum topics in group"),
         BotCommand(command="id", description="🆔 Get chat ID, topic ID & user ID"),
         BotCommand(command="xmovies", description="🎥 Quick XMoviesForYou scraper"),

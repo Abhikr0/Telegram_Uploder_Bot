@@ -357,6 +357,9 @@ async def upload_stream(client: TelegramClient,
             if inspect.isawaitable(r):
                 await r
 
+    if pos < file_size:
+        raise IOError(f"Stream ended prematurely: transferred {pos} of {file_size} bytes")
+
     await uploader.finish_upload()
     if is_large:
         return InputFileBig(file_id, part_count, file_name), file_size
@@ -369,14 +372,16 @@ async def upload_http_stream(client: TelegramClient,
                              file_name: str,
                              headers: Optional[dict] = None,
                              progress_callback: callable = None,
-                             timeout: float = 60.0) -> Tuple[TypeInputFile, int]:
+                             timeout: float = 120.0) -> Tuple[TypeInputFile, int]:
     """
     Streams directly from an HTTP(S) URL into Telegram MTProto parts with RAM buffering.
     Zero disk usage!
     """
     import httpx
-    t = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=30.0)
-    async with httpx.AsyncClient(headers=headers, timeout=t, follow_redirects=True) as http:
+    t = httpx.Timeout(connect=30.0, read=timeout, write=30.0, pool=60.0)
+    # Strip any Range header so the HTTP server serves the complete file rather than a 1KB slice
+    stream_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "range"}
+    async with httpx.AsyncClient(headers=stream_headers, timeout=t, follow_redirects=True) as http:
         async with http.stream("GET", url) as resp:
             resp.raise_for_status()
 

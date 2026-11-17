@@ -2693,10 +2693,12 @@ async def resolve_media_stream_info(domain: str, video: dict, client: httpx.Asyn
                 logger.warning(f"Skipping {video.get('name')} (Size: {total_server_size} bytes too small, likely broken)")
                 return {"status": "skipped_small", "file_size": total_server_size}
 
+            # Strip Range header so callers receive clean headers for downloading/streaming the full file
+            clean_headers = {k: v for k, v in req_headers.items() if k.lower() != "range"}
             return {
                 "status": "ok",
                 "url": url,
-                "headers": req_headers,
+                "headers": clean_headers,
                 "name": video.get("name") or "video.mp4",
                 "file_size": total_server_size
             }
