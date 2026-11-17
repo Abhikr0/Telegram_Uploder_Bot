@@ -2845,6 +2845,7 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
         try:
             os.makedirs(output_dir, exist_ok=True)
             logger.info(f"Downloading HLS/segmented stream via yt-dlp: {url[:60]}...")
+            loop = asyncio.get_running_loop()
             def _ytdl_download():
                 last_hook_time = [0.0]
                 def _hook(d):
@@ -2857,7 +2858,7 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
                             try:
                                 res = progress_callback(dl, tot)
                                 if asyncio.iscoroutine(res):
-                                    asyncio.run_coroutine_threadsafe(res, asyncio.get_event_loop())
+                                    asyncio.run_coroutine_threadsafe(res, loop)
                             except Exception: pass
 
                 ydl_opts = {
@@ -2868,6 +2869,10 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
                     'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                     'progress_hooks': [_hook],
                     'http_headers': headers,
+                    'concurrent_fragment_downloads': 10,
+                    'buffersize': 1024 * 1024,
+                    'retries': 10,
+                    'fragment_retries': 10,
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
