@@ -30,6 +30,12 @@ from scraper import (
     download_video,
     resolve_media_stream_info
 )
+from pimpbunny_adapter import (
+    parse_pimpbunny_url,
+    pimpbunny_to_video_dict,
+    fetch_pimpbunny_all_posts,
+    DEFAULT_DOMAIN as PINKBunny_DOMAIN,
+)
 
 hachoir.core.config.quiet = True
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -1203,7 +1209,7 @@ async def start_handler(event):
         "• <b>Universal Web Scraper & Crawler:</b> Any website, tube, blog, gallery, or direct video\n"
         "• <b>Viralchut:</b> Single videos, Categories, Tags, Search, Latest\n"
         "• <b>Bunkr:</b> Albums (<code>/a/</code>) & Videos (<code>/v/</code>, <code>/f/</code>)\n"
-        "• <b>Coomer / Kemono:</b> Creator profiles & single posts\n\n"
+        "• <b>PimpBunny:</b> Videos, Categories, Models, Tags (<code>https://pimpbunny.com/</code>)• <b>Coomer / Kemono:</b> Creator profiles & single posts\n\n"
         "📊 <b>Current System Overview:</b>\n"
         f"• <b>Status:</b> 🟢 Online & MTProto Ready\n"
         f"• <b>Storage Channels:</b> <code>{', '.join(str(c) for c in STORAGE_CHANNELS)}</code>\n"
@@ -1968,8 +1974,8 @@ async def download_handler(event):
             topic_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
     asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
 
-@client.on(events.NewMessage(pattern=r"^/viralchut(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
-async def viralchut_command_handler(event):
+@client.on(events.NewMessage(pattern=r"^/pimpbunny(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+async def pimpbunny_command_handler(event):
     if not await check_admin_or_notify(event): return
     url = event.pattern_match.group(1)
     page_range = event.pattern_match.group(2)
@@ -1978,10 +1984,10 @@ async def viralchut_command_handler(event):
             "🔥 <b>Viralchut Scraper</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Usage:\n"
-            "• <code>/viralchut https://viralchut.com/video-slug/</code>\n"
-            "• <code>/viralchut https://viralchut.com/category/desi-sex-scandal/</code>\n"
-            "• <code>/viralchut https://viralchut.com/tag/bhabhi-sex-mms/</code>\n"
-            "• <code>/viralchut https://viralchut.com/ 1-3</code>\n\n"
+            "• <code>/pimpbunny https://pimpbunny.com/video-slug/</code>\n"
+            "• <code>/pimpbunny https://pimpbunny.com/category/desi-sex-scandal/</code>\n"
+            "• <code>/pimpbunny https://pimpbunny.com/tag/bhabhi-sex-mms/</code>\n"
+            "• <code>/pimpbunny https://pimpbunny.com/ 1-3</code>\n\n"
             "Or simply paste any Viralchut link directly into this chat!",
             parse_mode='html'
         )
@@ -2419,6 +2425,7 @@ async def set_bot_commands():
         BotCommand(command="xmovies", description="🎥 Quick XMoviesForYou scraper"),
         BotCommand(command="uxseries", description="✨ Quick UXSeries scraper"),
         BotCommand(command="hdmaal", description="🎬 Quick HDMaal scraper"),
+        BotCommand(command="pimpbunny", description="🐰 Quick PimpBunny scraper"),
         BotCommand(command="viralchut", description="🔥 Quick Viralchut scraper"),
         BotCommand(command="bunkr", description="⚡ Quick Bunkr downloader"),
         BotCommand(command="stats", description="📊 Show uploader & storage stats"),

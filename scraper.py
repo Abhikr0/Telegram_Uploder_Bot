@@ -295,12 +295,30 @@ def parse_media_url(url: str) -> Tuple[Optional[str], Optional[str], Optional[st
         single_post_match = re.match(r"^/([^/]+)/user/([^/]+)/post/([^/?#]+)", clean_path)
         if single_post_match:
             return domain, single_post_match.group(1), single_post_match.group(2), single_post_match.group(3)
-            
+
         profile_match = re.match(r"^/([^/]+)/user/([^/?#]+)", clean_path)
         if profile_match:
             return domain, profile_match.group(1), profile_match.group(2), None
 
-    # 4. Direct Media File on ANY domain
+    # 4. Support PimpBunny URLs
+    if "pimpbunny" in domain_lower:
+        # Single video page: /videos/<slug>
+        single_match = re.match(r"^/videos/([^/?#]+)", clean_path)
+        if single_match:
+            slug = single_match.group(1)
+            return domain, "pimpbunny", slug, slug
+
+        # Catalog / listing: /categories/<slug>, /onlyfans-creators/<slug>, /tags/<slug>
+        list_match = re.match(r"^/(categories|onlyfans-creators|tags)/([^/?#]+)", clean_path)
+        if list_match:
+            slug = list_match.group(2)
+            return domain, "pimpbunny", slug, None
+
+        # Homepage
+        if clean_path in ("", "/"):
+            return domain, "pimpbunny", "home", None
+
+    # 5. Direct Media File on ANY domain
     if is_direct_media_url(url):
         filename = unquote(Path(clean_path).name)
         rel_path = clean_path.lstrip("/")
@@ -2170,6 +2188,13 @@ async def fetch_all_posts(domain: str, service: str, user_id: str, page_range: t
             return await fetch_uxseries_post(domain, post_id)
         return await fetch_uxseries_listing(domain, user_id, page_range)
 
+    # 0. PimpBunny (single video or catalog listing)
+    is_pimpbunny = (service == "pimpbunny" or "pimpbunny" in domain.lower())
+    if is_pimpbunny:
+        if post_id:
+            return await fetch_pimpbunny_post(domain, user_id, post_id)
+        return await fetch_pimpbunny_listing(domain, user_id, page_range)
+
     # 1. HDMaal
     is_hdmaal = (service == "hdmaal" or "hdmaal" in domain.lower())
     if is_hdmaal:
@@ -3112,6 +3137,29 @@ async def amain():
     print(f"🏁 Finished! Successfully downloaded: {success_count}/{len(videos)}")
     print(f"📂 Saved to: {output_dir.resolve()}")
     print("=" * 60)
+
+# ── PimpBunny (integrated via pimpbunny_adapter) ─────────────────────────────
+# The pimpbunny_scraper package lives next to this file under pimpbunny_scraper/
+# and is exposed by pimpbunny_adapter.py (same directory).
+
+
+async def fetch_pimpbunny_post(domain: str, user_id: str, post_id: str) -> list[dict]:
+    """Fetch a single PimpBunny video page into the bot's video-dict format."""
+    from pimpbunny_adapter import fetch_pimpbunny_all_posts
+
+    url = f"https://{domain}/videos/{post_id}/"
+    items = await fetch_pimpbunny_all_posts(url, service="pimpbunny")
+    return items
+
+
+async def fetch_pimpbunny_listing(domain: str, user_id: str, page_range=None) -> list[dict]:
+    """Fetch a PimpBunny catalog listing (category / model / homepage) into video-dict format."""
+    from pimpbunny_adapter import fetch_pimpbunny_all_posts
+
+    base_url = f"https://{domain}/" if user_id == "home" else f"https://{domain}/{user_id}/"
+    items = await fetch_pimpbunny_all_posts(base_url, service="pimpbunny")
+    return items
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.ERROR)
