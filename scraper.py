@@ -41,8 +41,8 @@ except ImportError:
 
 def is_direct_media_url(url: str) -> bool:
     """Check if URL points directly to a video/stream file."""
-    clean = urlparse(url).path.lower()
-    return any(clean.endswith(ext) for ext in STREAM_EXTENSIONS) or bool(re.search(r'\.(?:mp4|m3u8|mpd|webm|mov|mkv|avi|flv)(?:[?&#]|$)', url, re.I))
+    clean = urlparse(url).path.rstrip("/").lower()
+    return any(clean.endswith(ext) for ext in STREAM_EXTENSIONS) or bool(re.search(r'\.(?:mp4|m3u8|mpd|webm|mov|mkv|avi|flv)(?:[/?&#]|$)', url, re.I))
 
 MAX_RETRIES = 10
 RETRY_DELAY = 10        # seconds between retries
@@ -300,23 +300,29 @@ def parse_media_url(url: str) -> Tuple[Optional[str], Optional[str], Optional[st
         if profile_match:
             return domain, profile_match.group(1), profile_match.group(2), None
 
-    # 4. Support PimpBunny URLs
-    if "pimpbunny" in domain_lower:
-        # Single video page: /videos/<slug>
+    # 4. Support PimpBunny URLs (let direct .mp4/.m3u8 URLs fall through to direct media handler)
+    if "pimpbunny" in domain_lower and not is_direct_media_url(url):
+        # Single video page: /videos/<slug> (excluding paginated /videos/2/)
         single_match = re.match(r"^/videos/([^/?#]+)", clean_path)
-        if single_match:
+        if single_match and not single_match.group(1).isdigit():
             slug = single_match.group(1)
             return domain, "pimpbunny", slug, slug
 
         # Catalog / listing: /categories/<slug>, /onlyfans-creators/<slug>, /tags/<slug>
         list_match = re.match(r"^/(categories|onlyfans-creators|tags)/([^/?#]+)", clean_path)
-        if list_match:
-            slug = list_match.group(2)
-            return domain, "pimpbunny", slug, None
+        if list_match and not list_match.group(2).isdigit():
+            section, slug = list_match.group(1), list_match.group(2)
+            return domain, "pimpbunny", f"{section}/{slug}", None
 
-        # Homepage
-        if clean_path in ("", "/"):
+        # Section root / pagination (/videos/2/, /categories/2/, /2/, /)
+        sec_match = re.match(r"^/(videos|categories|onlyfans-creators|tags)(?:/\d+)?$", clean_path)
+        if sec_match:
+            return domain, "pimpbunny", sec_match.group(1), None
+
+        if clean_path in ("", "/") or re.match(r"^/\d+$", clean_path):
             return domain, "pimpbunny", "home", None
+
+        return domain, "pimpbunny", clean_path.strip("/"), None
 
     # 5. Direct Media File on ANY domain
     if is_direct_media_url(url):
@@ -1964,13 +1970,13 @@ async def extract_native_video(html: str, page_url: str) -> dict:
                 items.extend(data["@graph"])
             for item in items:
                 if isinstance(item, dict) and ("video" in str(item.get("@type", "")).lower() or item.get("@type") == "VideoObject"):
-                    c_url = item.get("contentUrl") or item.get("embedUrl")
+                    if not title and item.get("name"): title = item["name"]
+                    if not poster and item.get("thumbnailUrl"):
+                        th = item["thumbnailUrl"]
+                        poster = urljoin(page_url, th[0] if isinstance(th, list) else th)
+                    c_url = item.get("contentUrl")
                     if c_url:
                         video_url = urljoin(page_url, c_url)
-                        if not title and item.get("name"): title = item["name"]
-                        if not poster and item.get("thumbnailUrl"):
-                            th = item["thumbnailUrl"]
-                            poster = urljoin(page_url, th[0] if isinstance(th, list) else th)
                         break
         except Exception:
             pass
@@ -2000,7 +2006,22 @@ async def extract_native_video(html: str, page_url: str) -> dict:
                     video_url = cand
                     break
 
-    # JS Player Configs
+    # JS Player Configs (prefer tokenized KVS player URLs over untokenized get_file contentUrl)
+    if not video_url or ("/get_file/" in video_url and "v-acctoken" not in video_url):
+        kvs_candidates = []
+        for s in soup.find_all("script"):
+            txt = s.string or s.text or ""
+            if len(txt) < 10: continue
+            for km in re.finditer(r"video_(?:alt_)?url\d*\s*:\s*['\"](https?://[^'\"]+)['\"]", txt, re.I):
+                cand = km.group(1).replace("\\/", "/")
+                if "_preview.mp4" in cand.lower():
+                    continue
+                hm = re.search(r"_(\d{3,4})p\.(?:mp4|webm)", cand, re.I)
+                kvs_candidates.append((1 if "v-acctoken" in cand else 0, int(hm.group(1)) if hm else 0, cand))
+        if kvs_candidates:
+            kvs_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            video_url = kvs_candidates[0][2]
+
     if not video_url:
         for s in soup.find_all("script"):
             txt = s.string or s.text or ""
@@ -2066,6 +2087,11 @@ async def extract_universal_video(page_url: str, client: httpx.AsyncClient = Non
         close_client = True
     try:
         resp = await client.get(page_url)
+        if resp.status_code in (403, 429, 503) and any(
+            k in resp.text.lower() for k in ("bunny-shield", "shield-challenge", "establishing a secure connection")
+        ):
+            logger.warning(f"Anti-bot challenge (HTTP {resp.status_code}) blocking {page_url}")
+            return {}
         if resp.status_code == 200:
             native_data = await extract_native_video(resp.text, page_url)
             if native_data.get("url"):
@@ -2323,7 +2349,7 @@ def extract_video_urls(domain: str, posts: list[dict]) -> list[dict]:
 
         # Universal Web Videos (including Viralchut, UXSeries, HDMaal, XMoviesForYou, direct media, and crawled items)
         direct_url = p.get("url") or (p.get("file", {}).get("path") if str(p.get("file", {}).get("path", "")).startswith("http") else None) or p.get("viralchut_url") or p.get("uxseries_url") or p.get("hdmaal_url") or p.get("xmovies_url")
-        if direct_url or p.get("service") in ("viralchut", "uxseries", "hdmaal", "xmoviesforyou", "generic", "direct"):
+        if direct_url or p.get("service") in ("viralchut", "uxseries", "hdmaal", "xmoviesforyou", "pimpbunny", "generic", "direct"):
             url = direct_url or p.get("url")
             name = p.get("name") or (sanitize(post_title) + ".mp4")
             if url and url not in urls:
@@ -2397,13 +2423,16 @@ def sanitize(n: str) -> str:
 
 # ── Downloading ──────────────────────────────────────────────────────────────
 
-async def resolve_redirect_url(url: str, headers: dict) -> str:
+async def resolve_redirect_url(url: str, headers: dict, client: httpx.AsyncClient = None) -> str:
     """Follow redirects to get the final CDN URL (e.g. n2.coomer.st)."""
     if any(k in url.lower() for k in ["cdn.azmaal.com", "cdn.pmaal.com", "video.maalcdn.com"]):
         return url
     try:
         req_headers = dict(headers or {})
         req_headers.setdefault("Range", "bytes=0-10")
+        if client is not None:
+            async with client.stream("GET", url, headers=req_headers, timeout=15) as resp:
+                return str(resp.url)
         async with httpx.AsyncClient(headers=req_headers, follow_redirects=True, timeout=15) as c:
             async with c.stream("GET", url) as resp:
                 return str(resp.url)
@@ -2544,161 +2573,161 @@ async def resolve_media_stream_info(domain: str, video: dict, client: httpx.Asyn
     url = video.get("url") or video.get("bunkr_f_url")
     referer = f"https://{domain}/"
     headers = get_headers(domain, referer, is_media=True)
-
-    # 1. If UXSeries, resolve direct CDN URL if it's still an episode page
-    if video.get("service") == "uxseries" or "uxseries" in domain.lower():
-        raw_url = video.get("url") or video.get("uxseries_url")
-        if raw_url and "uxseries.co" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
-            try:
-                direct_url, resolved_name, meta = await resolve_uxseries_direct_url(raw_url, client=client)
-                if direct_url:
-                    url = direct_url
-                    video["url"] = direct_url
-                    if resolved_name:
-                        video["name"] = sanitize(resolved_name)
-                    if meta.get("poster") and not video.get("thumbnail"):
-                        video["thumbnail"] = meta["poster"]
-                    if meta.get("title") and not video.get("title"):
-                        video["title"] = meta["title"]
-                    if meta.get("actors") and not video.get("actors"):
-                        video["actors"] = meta["actors"]
-                    logger.info(f"Resolved UXSeries direct video URL: {raw_url} -> {url[:60]}...")
-            except Exception as e:
-                logger.error(f"Failed to resolve UXSeries direct video URL for {raw_url}: {e}")
-                return {"status": "error_html", "error": str(e)}
-
-        headers["Referer"] = f"https://{domain}/"
-        headers["Accept"] = "*/*"
-
-    # 2. If HDMaal, resolve direct CDN URL if it's still a post page
-    elif video.get("service") == "hdmaal" or "hdmaal" in domain.lower():
-        raw_url = video.get("url") or video.get("hdmaal_url")
-        if raw_url and "hdmaal.movie" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
-            try:
-                direct_url, resolved_name, meta = await resolve_hdmaal_direct_url(raw_url, client=client)
-                if direct_url:
-                    url = direct_url
-                    video["url"] = direct_url
-                    if resolved_name:
-                        video["name"] = sanitize(resolved_name)
-                    if meta.get("poster") and not video.get("thumbnail"):
-                        video["thumbnail"] = meta["poster"]
-                    if meta.get("title") and not video.get("title"):
-                        video["title"] = meta["title"]
-                    if meta.get("actors") and not video.get("actors"):
-                        video["actors"] = meta["actors"]
-                    logger.info(f"Resolved HDMaal direct video URL: {raw_url} -> {url[:60]}...")
-            except Exception as e:
-                logger.error(f"Failed to resolve HDMaal direct video URL for {raw_url}: {e}")
-                return {"status": "error_html", "error": str(e)}
-
-        headers["Referer"] = f"https://{domain}/"
-        headers["Accept"] = "*/*"
-
-    # 2. If XMoviesForYou, resolve direct stream m3u8 URL if it's still a post page
-    elif video.get("service") == "xmoviesforyou" or "xmoviesforyou" in domain.lower():
-        raw_url = video.get("url") or video.get("xmovies_url")
-        if raw_url and "xmoviesforyou.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in STREAM_EXTENSIONS):
-            try:
-                direct_url, resolved_name, meta = await resolve_xmovies_direct_url(raw_url, client=client)
-                if direct_url:
-                    url = direct_url
-                    video["url"] = direct_url
-                    if resolved_name:
-                        video["name"] = sanitize(resolved_name)
-                    if meta.get("poster") and not video.get("thumbnail"):
-                        video["thumbnail"] = meta["poster"]
-                    if meta.get("title") and not video.get("title"):
-                        video["title"] = meta["title"]
-                    if meta.get("actors") and not video.get("actors"):
-                        video["actors"] = meta["actors"]
-                    if meta.get("studio") and not video.get("studio"):
-                        video["studio"] = meta["studio"]
-                    logger.info(f"Resolved XMovies direct video URL: {raw_url} -> {url[:60]}...")
-            except Exception as e:
-                logger.error(f"Failed to resolve XMovies direct video URL for {raw_url}: {e}")
-                return {"status": "error_html", "error": str(e)}
-
-        headers["Referer"] = raw_url or f"https://{domain}/"
-        headers["Origin"] = f"https://{domain}"
-        headers["Accept"] = "*/*"
-
-    # 2. If Viralchut, resolve direct CDN URL if it's still a post page
-    elif video.get("service") == "viralchut" or "viralchut" in domain.lower():
-        raw_url = video.get("url") or video.get("viralchut_url")
-        if raw_url and "viralchut.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
-            try:
-                direct_url, resolved_name, meta = await resolve_viralchut_direct_url(raw_url, client=client)
-                if direct_url:
-                    url = direct_url
-                    video["url"] = direct_url
-                    if resolved_name:
-                        video["name"] = sanitize(resolved_name)
-                    if meta.get("poster") and not video.get("thumbnail"):
-                        video["thumbnail"] = meta["poster"]
-                    logger.info(f"Resolved Viralchut direct video URL: {raw_url} -> {url[:60]}...")
-            except Exception as e:
-                logger.error(f"Failed to resolve Viralchut direct video URL for {raw_url}: {e}")
-                return {"status": "error_html", "error": str(e)}
-
-        headers["Referer"] = f"https://{domain}/"
-        headers["Accept"] = "*/*"
-
-    # 2. If Bunkr, resolve direct CDN signed URL dynamically
-    elif video.get("service") == "bunkr" or video.get("bunkr_f_url") or "bunkr" in domain:
-        f_url = video.get("bunkr_f_url") or url
-        try:
-            url, resolved_name = await resolve_bunkr_direct_url(f_url, headers, client=client)
-            if resolved_name:
-                video["name"] = sanitize(resolved_name)
-            logger.info(f"Resolved Bunkr direct URL for streaming: {f_url} -> {url[:60]}...")
-            headers["Referer"] = BUNKR_DL_REFERER
-            headers["Origin"] = "https://bunkr.cr"
-            headers["Sec-Fetch-Site"] = "cross-site"
-            headers["Accept"] = "*/*"
-        except Exception as e:
-            logger.error(f"Failed to resolve Bunkr direct URL for {f_url}: {e}")
-            return {"status": "error_html", "error": str(e)}
-
-    # 3. Universal Web Video Resolution for any other website
-    elif url and not is_direct_media_url(url):
-        try:
-            item = await extract_universal_video(url, client=client)
-            if item and item.get("url"):
-                url = item["url"]
-                video["url"] = item["url"]
-                if item.get("name"): video["name"] = sanitize(item["name"])
-                if item.get("thumbnail") and not video.get("thumbnail"): video["thumbnail"] = item["thumbnail"]
-                if item.get("title") and not video.get("title"): video["title"] = item["title"]
-                logger.info(f"Resolved universal direct video URL: {video.get('name')} -> {url[:60]}...")
-        except Exception as e:
-            logger.warning(f"Universal stream resolution failed for {video.get('name')}: {e}")
-            return {"status": "error_html", "error": str(e)}
-
-    # If stream is HLS (.m3u8, .mpd) or fragmented: signal fallback to disk download pipeline
-    if any(x in url.lower() for x in [".m3u8", ".mpd"]):
-        logger.info(f"HLS/Segmented stream detected for {video.get('name')}. Routing to disk downloader pipeline...")
-        return {"status": "error_html", "error": "HLS stream requires disk download pipeline"}
-
-    # 2. Resolve redirects
-    resolved_url = await resolve_redirect_url(url, headers)
-    if resolved_url and resolved_url != url:
-        logger.info(f"Redirect resolved: {url} -> {resolved_url}")
-        url = resolved_url
-        cdn_host = urlparse(url).netloc
-        headers = get_headers(cdn_host, referer, is_media=True)
-        if any(x in cdn_host.lower() for x in ["bunkr", "balbums", "cdn.cr"]):
-            headers["Referer"] = BUNKR_DL_REFERER
-            headers["Origin"] = "https://bunkr.cr"
-            headers["Sec-Fetch-Site"] = "cross-site"
-
-    # 3. Probe headers to get Content-Length and validate status
-    close_client = False
-    if client is None:
+    close_client = client is None
+    if close_client:
         client = httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=30.0)
-        close_client = True
 
     try:
+        # 1. If UXSeries, resolve direct CDN URL if it's still an episode page
+        if video.get("service") == "uxseries" or "uxseries" in domain.lower():
+            raw_url = video.get("url") or video.get("uxseries_url")
+            if raw_url and "uxseries.co" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                try:
+                    direct_url, resolved_name, meta = await resolve_uxseries_direct_url(raw_url, client=client)
+                    if direct_url:
+                        url = direct_url
+                        video["url"] = direct_url
+                        if resolved_name:
+                            video["name"] = sanitize(resolved_name)
+                        if meta.get("poster") and not video.get("thumbnail"):
+                            video["thumbnail"] = meta["poster"]
+                        if meta.get("title") and not video.get("title"):
+                            video["title"] = meta["title"]
+                        if meta.get("actors") and not video.get("actors"):
+                            video["actors"] = meta["actors"]
+                        logger.info(f"Resolved UXSeries direct video URL: {raw_url} -> {url[:60]}...")
+                except Exception as e:
+                    logger.error(f"Failed to resolve UXSeries direct video URL for {raw_url}: {e}")
+                    return {"status": "error_html", "error": str(e)}
+
+            headers["Referer"] = f"https://{domain}/"
+            headers["Accept"] = "*/*"
+
+        # 2. If HDMaal, resolve direct CDN URL if it's still a post page
+        elif video.get("service") == "hdmaal" or "hdmaal" in domain.lower():
+            raw_url = video.get("url") or video.get("hdmaal_url")
+            if raw_url and "hdmaal.movie" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                try:
+                    direct_url, resolved_name, meta = await resolve_hdmaal_direct_url(raw_url, client=client)
+                    if direct_url:
+                        url = direct_url
+                        video["url"] = direct_url
+                        if resolved_name:
+                            video["name"] = sanitize(resolved_name)
+                        if meta.get("poster") and not video.get("thumbnail"):
+                            video["thumbnail"] = meta["poster"]
+                        if meta.get("title") and not video.get("title"):
+                            video["title"] = meta["title"]
+                        if meta.get("actors") and not video.get("actors"):
+                            video["actors"] = meta["actors"]
+                        logger.info(f"Resolved HDMaal direct video URL: {raw_url} -> {url[:60]}...")
+                except Exception as e:
+                    logger.error(f"Failed to resolve HDMaal direct video URL for {raw_url}: {e}")
+                    return {"status": "error_html", "error": str(e)}
+
+            headers["Referer"] = f"https://{domain}/"
+            headers["Accept"] = "*/*"
+
+        # 2. If XMoviesForYou, resolve direct stream m3u8 URL if it's still a post page
+        elif video.get("service") == "xmoviesforyou" or "xmoviesforyou" in domain.lower():
+            raw_url = video.get("url") or video.get("xmovies_url")
+            if raw_url and "xmoviesforyou.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in STREAM_EXTENSIONS):
+                try:
+                    direct_url, resolved_name, meta = await resolve_xmovies_direct_url(raw_url, client=client)
+                    if direct_url:
+                        url = direct_url
+                        video["url"] = direct_url
+                        if resolved_name:
+                            video["name"] = sanitize(resolved_name)
+                        if meta.get("poster") and not video.get("thumbnail"):
+                            video["thumbnail"] = meta["poster"]
+                        if meta.get("title") and not video.get("title"):
+                            video["title"] = meta["title"]
+                        if meta.get("actors") and not video.get("actors"):
+                            video["actors"] = meta["actors"]
+                        if meta.get("studio") and not video.get("studio"):
+                            video["studio"] = meta["studio"]
+                        logger.info(f"Resolved XMovies direct video URL: {raw_url} -> {url[:60]}...")
+                except Exception as e:
+                    logger.error(f"Failed to resolve XMovies direct video URL for {raw_url}: {e}")
+                    return {"status": "error_html", "error": str(e)}
+
+            headers["Referer"] = raw_url or f"https://{domain}/"
+            headers["Origin"] = f"https://{domain}"
+            headers["Accept"] = "*/*"
+
+        # 2. If Viralchut, resolve direct CDN URL if it's still a post page
+        elif video.get("service") == "viralchut" or "viralchut" in domain.lower():
+            raw_url = video.get("url") or video.get("viralchut_url")
+            if raw_url and "viralchut.com" in raw_url and not any(raw_url.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                try:
+                    direct_url, resolved_name, meta = await resolve_viralchut_direct_url(raw_url, client=client)
+                    if direct_url:
+                        url = direct_url
+                        video["url"] = direct_url
+                        if resolved_name:
+                            video["name"] = sanitize(resolved_name)
+                        if meta.get("poster") and not video.get("thumbnail"):
+                            video["thumbnail"] = meta["poster"]
+                        logger.info(f"Resolved Viralchut direct video URL: {raw_url} -> {url[:60]}...")
+                except Exception as e:
+                    logger.error(f"Failed to resolve Viralchut direct video URL for {raw_url}: {e}")
+                    return {"status": "error_html", "error": str(e)}
+
+            headers["Referer"] = f"https://{domain}/"
+            headers["Accept"] = "*/*"
+
+        # 2. If Bunkr, resolve direct CDN signed URL dynamically
+        elif video.get("service") == "bunkr" or video.get("bunkr_f_url") or "bunkr" in domain:
+            f_url = video.get("bunkr_f_url") or url
+            try:
+                url, resolved_name = await resolve_bunkr_direct_url(f_url, headers, client=client)
+                if resolved_name:
+                    video["name"] = sanitize(resolved_name)
+                logger.info(f"Resolved Bunkr direct URL for streaming: {f_url} -> {url[:60]}...")
+                headers["Referer"] = BUNKR_DL_REFERER
+                headers["Origin"] = "https://bunkr.cr"
+                headers["Sec-Fetch-Site"] = "cross-site"
+                headers["Accept"] = "*/*"
+            except Exception as e:
+                logger.error(f"Failed to resolve Bunkr direct URL for {f_url}: {e}")
+                return {"status": "error_html", "error": str(e)}
+
+        # 3. Universal Web Video Resolution for any other website
+        elif url and not is_direct_media_url(url):
+            try:
+                item = await extract_universal_video(url, client=client)
+                if item and item.get("url"):
+                    url = item["url"]
+                    video["url"] = item["url"]
+                    if item.get("name"): video["name"] = sanitize(item["name"])
+                    if item.get("thumbnail") and not video.get("thumbnail"): video["thumbnail"] = item["thumbnail"]
+                    if item.get("title") and not video.get("title"): video["title"] = item["title"]
+                    logger.info(f"Resolved universal direct video URL: {video.get('name')} -> {url[:60]}...")
+                else:
+                    return {"status": "error_html", "error": "No direct stream URL resolved"}
+            except Exception as e:
+                logger.warning(f"Universal stream resolution failed for {video.get('name')}: {e}")
+                return {"status": "error_html", "error": str(e)}
+
+        # If stream is HLS (.m3u8, .mpd) or fragmented: signal fallback to disk download pipeline
+        if any(x in url.lower() for x in [".m3u8", ".mpd"]):
+            logger.info(f"HLS/Segmented stream detected for {video.get('name')}. Routing to disk downloader pipeline...")
+            return {"status": "error_html", "error": "HLS stream requires disk download pipeline"}
+
+        # 2. Resolve redirects
+        resolved_url = await resolve_redirect_url(url, headers, client=client)
+        if resolved_url and resolved_url != url:
+            logger.info(f"Redirect resolved: {url} -> {resolved_url}")
+            url = resolved_url
+            cdn_host = urlparse(url).netloc
+            headers = get_headers(cdn_host, referer, is_media=True)
+            if any(x in cdn_host.lower() for x in ["bunkr", "balbums", "cdn.cr"]):
+                headers["Referer"] = BUNKR_DL_REFERER
+                headers["Origin"] = "https://bunkr.cr"
+                headers["Sec-Fetch-Site"] = "cross-site"
+
+        # 3. Probe headers to get Content-Length and validate status
         # Send lightweight stream request to inspect response headers without downloading body
         req_headers = headers.copy()
         if "Range" not in req_headers:
@@ -2755,8 +2784,14 @@ async def resolve_media_stream_info(domain: str, video: dict, client: httpx.Asyn
             await client.aclose()
 
 
-async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 0, client: httpx.AsyncClient = None, progress_callback: Callable = None) -> str | bool:
-    """Download video with resume support and progress bar (asynchronous)."""
+async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 0, client: httpx.AsyncClient = None, progress_callback: Callable = None, http_connections: Optional[int] = None) -> str | bool:
+    """Download video with multi-range acceleration, resume support, and progress bar."""
+    if http_connections is None:
+        is_termux = bool(os.getenv("TERMUX_VERSION")) or "com.termux" in os.getenv("PREFIX", "")
+        try:
+            http_connections = max(1, int(os.getenv("HTTP_STREAM_CONNECTIONS", 3 if is_termux else 6)))
+        except (TypeError, ValueError):
+            http_connections = 3 if is_termux else 6
     url = video["url"]
     filepath = output_dir / f"{video['id']}_{video['name']}"
     referer = f"https://{domain}/"
@@ -2942,31 +2977,168 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
             headers["Origin"] = "https://bunkr.cr"
             headers["Sec-Fetch-Site"] = "cross-site"
     
+    async def _download_multi_range(
+        c: httpx.AsyncClient,
+        initial_bytes: bytes,
+        total_size: int,
+        base_headers: dict,
+        workers_count: int,
+    ) -> bool:
+        tmp_part = filepath.with_name(filepath.name + ".mrange")
+        os.makedirs(output_dir, exist_ok=True)
+        segment_size = 2 * 1024 * 1024
+        downloaded_bytes = len(initial_bytes)
+        last_cb_time = 0.0
+
+        async def _notify(force: bool = False) -> None:
+            nonlocal last_cb_time
+            if not progress_callback:
+                return
+            now = time.time()
+            if not force and now - last_cb_time < 1.5:
+                return
+            last_cb_time = now
+            try:
+                res = progress_callback(downloaded_bytes, total_size)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
+
+        with open(tmp_part, "wb") as f_init:
+            if initial_bytes:
+                f_init.write(initial_bytes)
+            f_init.truncate(total_size)
+
+        try:
+            with open(tmp_part, "r+b") as f_out, tqdm(
+                total=total_size,
+                initial=downloaded_bytes,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=f"   {video['name'][:30]}",
+                position=pos,
+                leave=False,
+                ncols=80,
+            ) as pbar:
+                await _notify(force=True)
+                ranges: list[tuple[int, int]] = []
+                offset = len(initial_bytes)
+                while offset < total_size:
+                    end = min(total_size - 1, offset + segment_size - 1)
+                    ranges.append((offset, end))
+                    offset = end + 1
+
+                range_q: asyncio.Queue = asyncio.Queue()
+                for r in ranges:
+                    range_q.put_nowait(r)
+
+                async def _worker() -> None:
+                    nonlocal downloaded_bytes
+                    while True:
+                        try:
+                            seg_start, seg_end = range_q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        cur_pos = seg_start
+                        seg_attempt = 0
+                        while cur_pos <= seg_end:
+                            seg_hdrs = {
+                                k: v for k, v in base_headers.items()
+                                if k.lower() not in ("range", "accept-encoding")
+                            }
+                            seg_hdrs["Accept-Encoding"] = "identity"
+                            seg_hdrs["Range"] = f"bytes={cur_pos}-{seg_end}"
+                            try:
+                                async with c.stream("GET", url, headers=seg_hdrs, timeout=60) as sr:
+                                    if sr.status_code in (401, 403, 404, 429, 500, 502, 503, 504):
+                                        raise IOError(f"HTTP {sr.status_code} on range {cur_pos}-{seg_end}")
+                                    sr.raise_for_status()
+                                    if sr.status_code != 206:
+                                        raise IOError(f"Expected 206, got {sr.status_code}")
+                                    async for chunk in sr.aiter_bytes(CHUNK_SIZE):
+                                        if not chunk:
+                                            continue
+                                        need = (seg_end - cur_pos) + 1
+                                        if need <= 0:
+                                            break
+                                        if len(chunk) > need:
+                                            chunk = chunk[:need]
+                                        f_out.seek(cur_pos)
+                                        f_out.write(chunk)
+                                        cur_pos += len(chunk)
+                                        pbar.update(len(chunk))
+                                        downloaded_bytes += len(chunk)
+                                        await _notify()
+                            except Exception as seg_err:
+                                seg_attempt += 1
+                                if seg_attempt >= 5:
+                                    raise IOError(f"Segment {seg_start}-{seg_end} failed: {seg_err}") from seg_err
+                                await asyncio.sleep(min(2 * seg_attempt, 8))
+
+                worker_tasks = [
+                    asyncio.create_task(_worker())
+                    for _ in range(min(workers_count, max(1, len(ranges))))
+                ]
+                try:
+                    await asyncio.gather(*worker_tasks)
+                except Exception:
+                    for wt in worker_tasks:
+                        if not wt.done():
+                            wt.cancel()
+                    await asyncio.gather(*worker_tasks, return_exceptions=True)
+                    raise
+
+            if tmp_part.stat().st_size != total_size:
+                raise ValueError(f"Incomplete multi-range download: {tmp_part.stat().st_size}/{total_size}")
+            await _notify(force=True)
+            os.replace(tmp_part, filepath)
+            return True
+        except Exception:
+            if tmp_part.exists():
+                try:
+                    os.remove(tmp_part)
+                except Exception:
+                    pass
+            raise
+
     async def _do_download(c: httpx.AsyncClient):
+        use_multi = max(1, int(http_connections or 1))
+        probe_bytes = 512 * 1024
         for attempt in range(1, MAX_RETRIES + 1):
             total_server_size = 0
+            skip_retry_delay = False
             try:
                 start_pos = 0
                 if filepath.exists():
                     start_pos = filepath.stat().st_size
-                
+
+                use_probe_range = (start_pos == 0 and use_multi > 1)
                 # Prepare Range request
                 req_headers = headers.copy()
+                req_headers["Accept-Encoding"] = "identity"
                 if start_pos > 0:
                     req_headers["Range"] = f"bytes={start_pos}-"
+                elif use_probe_range:
+                    req_headers["Range"] = f"bytes=0-{probe_bytes - 1}"
                 if any(x in url.lower() for x in ["bunkr", "balbums", "cdn.cr"]):
                     req_headers["Referer"] = BUNKR_DL_REFERER
                     req_headers["Origin"] = "https://bunkr.cr"
-                
+
                 async with c.stream("GET", url, headers=req_headers, timeout=60) as resp:
-                    if resp.status_code == 416: 
+                    if resp.status_code == 416:
+                        if use_probe_range:
+                            use_multi = 1
+                            skip_retry_delay = True
+                            raise ValueError("Server rejected initial probe range; switching to single stream")
                         # Range not satisfiable: file might already be complete
                         if filepath.exists() and filepath.stat().st_size >= MIN_FILE_SIZE:
                             return True
                         else:
                             if filepath.exists(): os.remove(filepath)
                             raise ValueError("Range 416 error but file size mismatch. Restarting.")
-                    
+
                     if resp.status_code in (401, 403, 404):
                         logger.error(f"HTTP {resp.status_code} error when downloading {video['name']}")
                         return "error_html"
@@ -2978,20 +3150,23 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
 
                     content_range = resp.headers.get("Content-Range", "")
                     if content_range and "/" in content_range:
-                        try:
-                            total_server_size = int(content_range.split("/")[-1])
-                        except ValueError:
-                            total_server_size = 0
-                    elif resp.status_code == 206:
+                        total_part = content_range.split("/")[-1].strip()
+                        total_server_size = int(total_part) if total_part.isdigit() else 0
+                    elif resp.status_code == 206 and not use_probe_range:
                         content_len = int(resp.headers.get("Content-Length", 0))
                         total_server_size = start_pos + content_len
-                    else:
+                    elif resp.status_code != 206:
                         total_server_size = int(resp.headers.get("Content-Length", 0))
-                    
+
+                    if use_probe_range and resp.status_code == 206 and total_server_size == 0:
+                        use_multi = 1
+                        skip_retry_delay = True
+                        raise ValueError("206 response missing total size in Content-Range; switching to single stream")
+
                     if total_server_size > MAX_FILE_SIZE:
                         logger.warning(f"Skipping {video['name']} (Size: {total_server_size} bytes exceeds 2000MB limit)")
                         return "skipped_size"
-                    
+
                     if 0 < total_server_size < MIN_FILE_SIZE and start_pos == 0:
                         logger.warning(f"Skipping {video['name']} (Size: {total_server_size} bytes too small, likely broken)")
                         return "skipped_small"
@@ -2999,9 +3174,26 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
                     if start_pos >= total_server_size and total_server_size > 0:
                         return True
 
+                    if use_probe_range and resp.status_code == 206 and total_server_size >= 4 * 1024 * 1024:
+                        init_buf = bytearray()
+                        async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                            if chunk:
+                                init_buf.extend(chunk)
+                        if len(init_buf) < min(probe_bytes, total_server_size):
+                            raise ValueError("Truncated initial multi-range probe")
+                        try:
+                            return await _download_multi_range(
+                                c, bytes(init_buf), total_server_size, headers, use_multi
+                            )
+                        except Exception as mr_err:
+                            logger.warning(f"Multi-range download failed for {video['name']} ({mr_err}); falling back to single stream...")
+                            use_multi = 1
+                            skip_retry_delay = True
+                            raise
+
                     is_resume = (start_pos > 0 and resp.status_code == 206)
                     mode = "ab" if is_resume else "wb"
-                    if mode == "wb": 
+                    if mode == "wb":
                         start_pos = 0
 
                     downloaded_bytes = start_pos
@@ -3041,23 +3233,26 @@ async def download_video(domain: str, video: dict, output_dir: Path, pos: int = 
                                 await res
                         except Exception:
                             pass
-                
+
                 # Final verification
                 if filepath.exists():
                     final_size = filepath.stat().st_size
                     if total_server_size > 0 and final_size < total_server_size:
                         raise ValueError(f"Incomplete download: {final_size}/{total_server_size} bytes")
-                
+
                 return True
 
             except Exception as e:
                 if attempt < MAX_RETRIES:
-                    logger.warning(f"Attempt {attempt}/{MAX_RETRIES} failed for {video['name']}: {e}. Retrying in {RETRY_DELAY}s...")
-                    await asyncio.sleep(RETRY_DELAY)
+                    if not skip_retry_delay:
+                        logger.warning(f"Attempt {attempt}/{MAX_RETRIES} failed for {video['name']}: {e}. Retrying in {RETRY_DELAY}s...")
+                        await asyncio.sleep(RETRY_DELAY)
+                    else:
+                        logger.info(f"Switching {video['name']} to single-stream download immediately...")
                 else:
                     logger.error(f"Failed to download {video['name']} after {MAX_RETRIES} attempts: {e}")
                     if filepath.exists() and total_server_size > 0 and filepath.stat().st_size < total_server_size:
-                        try: os.remove(filepath) 
+                        try: os.remove(filepath)
                         except: pass
                     return False
         return False
@@ -3176,8 +3371,8 @@ async def fetch_pimpbunny_listing(domain: str, user_id: str, page_range=None) ->
     """Fetch a PimpBunny catalog listing (category / model / homepage) into video-dict format."""
     from pimpbunny_adapter import fetch_pimpbunny_all_posts
 
-    base_url = f"https://{domain}/" if user_id == "home" else f"https://{domain}/{user_id}/"
-    items = await fetch_pimpbunny_all_posts(base_url, service="pimpbunny")
+    base_url = f"https://{domain}/" if user_id == "home" else f"https://{domain}/{user_id.strip('/')}/"
+    items = await fetch_pimpbunny_all_posts(base_url, page_range=page_range, service="pimpbunny")
     return items
 
 

@@ -90,6 +90,8 @@ ENABLE_STREAM_UPLOAD = os.getenv(
 STREAM_CONCURRENCY = _env_int("STREAM_CONCURRENCY", 1 if IS_TERMUX else 2)
 DOWNLOAD_CONCURRENCY = _env_int("DOWNLOAD_CONCURRENCY", 2 if IS_TERMUX else 3)
 MTPROTO_CONNECTIONS = _env_int("MTPROTO_CONNECTIONS", 2 if IS_TERMUX else 4)
+MTPROTO_PIPELINE_DEPTH = _env_int("MTPROTO_PIPELINE_DEPTH", 2)
+HTTP_STREAM_CONNECTIONS = _env_int("HTTP_STREAM_CONNECTIONS", 3 if IS_TERMUX else 6)
 STREAM_PROBE_BYTES = _env_int(
     "STREAM_PROBE_BYTES", 6 * 1024 * 1024 if IS_TERMUX else 16 * 1024 * 1024, minimum=1024 * 1024
 )
@@ -1031,7 +1033,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                             with open(filepath, "rb") as f:
                                 uploaded_file = await upload_file(
                                     client, f, progress_callback=upload_progress,
-                                    file_name=clean_name, connection_count=MTPROTO_CONNECTIONS
+                                    file_name=clean_name, connection_count=MTPROTO_CONNECTIONS,
+                                    pipeline_depth=MTPROTO_PIPELINE_DEPTH,
                                 )
                             sent_msg = await _send_video_with_thumb(
                                 target_channel_id, uploaded_file, clean_name,
@@ -1065,7 +1068,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     await BAR_MANAGER.release_pos(pos)
 
         async def stream_pipeline_worker(vid):
-            vid = dict(vid)
+            orig_vid = dict(vid)
+            vid = dict(orig_vid)
             if 'name' not in vid or not vid['name'].lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v')):
                 vid['name'] = (vid.get('name') or 'video') + '.mp4'
             pos = await BAR_MANAGER.get_pos()
@@ -1089,6 +1093,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     return
                 elif status == "error_html" or not info.get("url") or not info.get("file_size"):
                     logger.warning(f"Stream resolution unavailable for {vid_name} ({info.get('error', 'no length')}). Falling back to disk pipeline...")
+                    state["active_uploads"].pop(vid_name, None)
                     await disk_pipeline_worker(vid, pos)
                     return
 
@@ -1096,6 +1101,16 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 stream_headers = {k: v for k, v in info.get("headers", {}).items() if k.lower() != "range"}
                 file_size = info["file_size"]
                 stream_filename = info.get("name") or f"{vid['id']}_{vid_name}"
+
+                async def refresh_stream():
+                    ref_vid = dict(orig_vid)
+                    if 'name' not in ref_vid or not ref_vid['name'].lower().endswith(('.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v')):
+                        ref_vid['name'] = (ref_vid.get('name') or 'video') + '.mp4'
+                    ref_info = await resolve_media_stream_info(domain, ref_vid)
+                    if ref_info.get("status") == "ok" and ref_info.get("url"):
+                        ref_hdrs = {k: v for k, v in ref_info.get("headers", {}).items() if k.lower() != "range"}
+                        return ref_info["url"], ref_hdrs
+                    return None
 
                 state["active_uploads"][vid_name] = "<code>[Probing Stream...] ⚙️</code>"
                 thumb_path = temp_dir / f"{vid['id']}_{uuid.uuid4().hex[:8]}_thumb.jpg"
@@ -1126,7 +1141,10 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 file_name=clean_name,
                                 headers=stream_headers,
                                 progress_callback=upload_progress,
-                                connection_count=MTPROTO_CONNECTIONS
+                                connection_count=MTPROTO_CONNECTIONS,
+                                http_connections=HTTP_STREAM_CONNECTIONS,
+                                pipeline_depth=MTPROTO_PIPELINE_DEPTH,
+                                url_refresh_cb=refresh_stream,
                             )
                             sent_msg = await _send_video_with_thumb(
                                 target_channel_id, uploaded_file, clean_name,
@@ -1136,6 +1154,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                     except Exception as e:
                         if attempt == MAX_UPLOAD_RETRIES:
                             logger.warning(f"Stream upload failed for {vid_name} after {MAX_UPLOAD_RETRIES} attempts: {e}. Falling back to disk pipeline...")
+                            state["active_uploads"].pop(vid_name, None)
                             await disk_pipeline_worker(vid, pos)
                             return
                         logger.warning(f"Stream attempt {attempt} failed for {vid_name}: {e}. Retrying in {RETRY_DELAY}s...")
@@ -1240,7 +1259,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                     with open(filepath, "rb") as f:
                                         uploaded_file = await upload_file(
                                             client, f, progress_callback=upload_progress,
-                                            file_name=clean_name, connection_count=MTPROTO_CONNECTIONS
+                                            file_name=clean_name, connection_count=MTPROTO_CONNECTIONS,
+                                            pipeline_depth=MTPROTO_PIPELINE_DEPTH,
                                         )
                                     sent_msg = await _send_video_with_thumb(
                                         target_channel_id, uploaded_file, clean_name,
@@ -2121,14 +2141,14 @@ async def pimpbunny_command_handler(event):
     page_range = event.pattern_match.group(2)
     if not url:
         await event.respond(
-            "🔥 <b>Viralchut Scraper</b>\n"
+            "🐰 <b>PimpBunny Scraper</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "Usage:\n"
-            "• <code>/pimpbunny https://pimpbunny.com/video-slug/</code>\n"
-            "• <code>/pimpbunny https://pimpbunny.com/category/desi-sex-scandal/</code>\n"
-            "• <code>/pimpbunny https://pimpbunny.com/tag/bhabhi-sex-mms/</code>\n"
+            "• <code>/pimpbunny https://pimpbunny.com/videos/video-slug/</code>\n"
+            "• <code>/pimpbunny https://pimpbunny.com/onlyfans-creators/model-slug/</code>\n"
+            "• <code>/pimpbunny https://pimpbunny.com/categories/bbc/</code>\n"
             "• <code>/pimpbunny https://pimpbunny.com/ 1-3</code>\n\n"
-            "Or simply paste any Viralchut link directly into this chat!",
+            "Or simply paste any PimpBunny link directly into this chat!",
             parse_mode='html'
         )
         return
