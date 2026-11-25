@@ -4,9 +4,6 @@ telethon>=1.24.0
 python-dotenv>=0.20.0
 httpx>=0.24.0
 hachoir>=3.2.0
-ffmpeg-python
-imageio-ffmpeg>=0.4.9
+imageio-ffmpeg>=0.4.9; sys_platform == "win32" or sys_platform == "darwin" or (sys_platform == "linux" and platform_machine == "x86_64")
 beautifulsoup4>=4.12.0
-supabase>=2.3.0
 yt-dlp>=2026.0.0
-

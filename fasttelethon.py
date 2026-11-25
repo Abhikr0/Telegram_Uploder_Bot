@@ -248,14 +248,17 @@ def stream_file(file_to_stream: BinaryIO, chunk_size=512 * 1024):
 async def _internal_transfer_to_telegram(client: TelegramClient,
                                          response: BinaryIO,
                                          progress_callback: callable,
-                                         file_name: Optional[str] = None
+                                         file_name: Optional[str] = None,
+                                         connection_count: Optional[int] = None
                                          ) -> Tuple[TypeInputFile, int]:
     file_id = helpers.generate_random_long()
     file_size = os.path.getsize(response.name)
 
     hash_md5 = hashlib.md5()
     uploader = ParallelTransferrer(client)
-    part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
+    part_size, part_count, is_large = await uploader.init_upload(
+        file_id, file_size, connection_count=connection_count
+    )
 
     try:
         response.seek(0)
@@ -307,9 +310,12 @@ async def download_file(client: TelegramClient,
 async def upload_file(client: TelegramClient,
                       file: BinaryIO,
                       progress_callback: callable = None,
-                      file_name: Optional[str] = None
+                      file_name: Optional[str] = None,
+                      connection_count: Optional[int] = None
                       ) -> TypeInputFile:
-    res = (await _internal_transfer_to_telegram(client, file, progress_callback, file_name=file_name))[0]
+    res = (await _internal_transfer_to_telegram(
+        client, file, progress_callback, file_name=file_name, connection_count=connection_count
+    ))[0]
     return res
 
 
@@ -317,7 +323,8 @@ async def upload_stream(client: TelegramClient,
                         stream: AsyncIterable[bytes],
                         file_size: int,
                         file_name: str,
-                        progress_callback: callable = None) -> Tuple[TypeInputFile, int]:
+                        progress_callback: callable = None,
+                        connection_count: Optional[int] = None) -> Tuple[TypeInputFile, int]:
     """
     Upload an async stream of bytes directly to Telegram via ParallelTransferrer.
     Zero disk usage!
@@ -325,7 +332,9 @@ async def upload_stream(client: TelegramClient,
     file_id = helpers.generate_random_long()
     hash_md5 = hashlib.md5()
     uploader = ParallelTransferrer(client)
-    part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
+    part_size, part_count, is_large = await uploader.init_upload(
+        file_id, file_size, connection_count=connection_count
+    )
 
     pos = 0
     buffer = bytearray()
@@ -372,7 +381,8 @@ async def upload_http_stream(client: TelegramClient,
                              file_name: str,
                              headers: Optional[dict] = None,
                              progress_callback: callable = None,
-                             timeout: float = 120.0) -> Tuple[TypeInputFile, int]:
+                             timeout: float = 120.0,
+                             connection_count: Optional[int] = None) -> Tuple[TypeInputFile, int]:
     """
     Streams directly from an HTTP(S) URL into Telegram MTProto parts with RAM buffering.
     Zero disk usage!
@@ -407,6 +417,7 @@ async def upload_http_stream(client: TelegramClient,
                 stream=resp.aiter_bytes(),
                 file_size=file_size,
                 file_name=file_name,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                connection_count=connection_count
             )
 

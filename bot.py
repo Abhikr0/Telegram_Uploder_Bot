@@ -8,8 +8,10 @@ import time
 import uuid
 import subprocess
 import re
+import mimetypes
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 import httpx
 from telethon import TelegramClient, events, Button, functions, errors
@@ -67,25 +69,109 @@ for x in raw_storage.replace('"', '').replace("'", "").split(","):
             pass
 STORAGE_CHANNEL_ID = STORAGE_CHANNELS[0] if STORAGE_CHANNELS else 0
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "bot_downloads")
-ENABLE_STREAM_UPLOAD = os.getenv("ENABLE_STREAM_UPLOAD", "true").lower() in ("true", "1", "yes")
+IS_TERMUX = bool(os.getenv("TERMUX_VERSION")) or "com.termux" in os.getenv("PREFIX", "")
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+_raw_download_dir = os.getenv("DOWNLOAD_DIR", "bot_downloads").strip() or "bot_downloads"
+if sys.platform != "win32" and re.match(r"^[a-zA-Z]:(?:[/\\]|$)", _raw_download_dir):
+    logger.warning(
+        f"Ignoring Windows drive path DOWNLOAD_DIR={_raw_download_dir!r} on {sys.platform}; using 'bot_downloads'"
+    )
+    _raw_download_dir = "bot_downloads"
+DOWNLOAD_DIR = str(Path(_raw_download_dir).resolve())
+ENABLE_STREAM_UPLOAD = os.getenv(
+    "ENABLE_STREAM_UPLOAD", "false" if IS_TERMUX else "true"
+).lower() in ("true", "1", "yes")
+STREAM_CONCURRENCY = _env_int("STREAM_CONCURRENCY", 1 if IS_TERMUX else 2)
+DOWNLOAD_CONCURRENCY = _env_int("DOWNLOAD_CONCURRENCY", 2 if IS_TERMUX else 3)
+MTPROTO_CONNECTIONS = _env_int("MTPROTO_CONNECTIONS", 2 if IS_TERMUX else 4)
+STREAM_PROBE_BYTES = _env_int(
+    "STREAM_PROBE_BYTES", 6 * 1024 * 1024 if IS_TERMUX else 16 * 1024 * 1024, minimum=1024 * 1024
+)
+SESSION_NAME = os.getenv("TELETHON_SESSION", "uploader_bot_session").strip() or "uploader_bot_session"
+
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+
+
+class SupabaseRestClient:
+    """Lightweight async PostgREST client using httpx (avoids pydantic/Rust deps on Termux)."""
+
+    def __init__(self, url: str, key: str):
+        self.base_url = url.rstrip("/")
+        self.headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+
+    async def insert(self, table: str, row: dict) -> None:
+        headers = {**self.headers, "Prefer": "return=minimal"}
+        async with httpx.AsyncClient(timeout=15.0) as http_client:
+            resp = await http_client.post(
+                f"{self.base_url}/rest/v1/{table}",
+                headers=headers,
+                json=row,
+            )
+            resp.raise_for_status()
+
+    async def count(self, table: str) -> int:
+        headers = {**self.headers, "Prefer": "count=exact", "Range": "0-0"}
+        async with httpx.AsyncClient(timeout=15.0) as http_client:
+            resp = await http_client.get(
+                f"{self.base_url}/rest/v1/{table}?select=id",
+                headers=headers,
+            )
+            if resp.status_code not in (200, 206, 416):
+                resp.raise_for_status()
+            content_range = resp.headers.get("Content-Range", "")
+            if "/" in content_range:
+                total_part = content_range.split("/")[-1].strip()
+                if total_part.isdigit():
+                    return int(total_part)
+            return 0
+
 
 supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
+    supabase_client = SupabaseRestClient(SUPABASE_URL, SUPABASE_KEY)
+    logging.info("Configured lightweight Supabase REST client for automatic upload indexing.")
+
+async def _index_to_supabase(db_title: str, message_id: int, file_size: int) -> None:
+    if not supabase_client:
+        return
     try:
-        from supabase import create_client
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logging.info("Connected to Supabase for automatic upload indexing.")
-    except Exception as e:
-        logging.warning(f"Could not connect to Supabase: {e}")
+        db_entry = {
+            "id": str(uuid.uuid4()),
+            "title": db_title[:150],
+            "file_id": "mtproto_uploaded",
+            "message_id": message_id,
+            "file_size": file_size,
+            "upload_date": datetime.now(timezone.utc).isoformat(),
+        }
+        await supabase_client.insert("media", db_entry)
+        logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {message_id})")
+    except Exception as db_err:
+        logger.warning(f"Supabase auto-index error: {db_err}")
+
+async def _get_supabase_media_count() -> str:
+    if not supabase_client:
+        return "N/A"
+    try:
+        return str(await supabase_client.count("media"))
+    except Exception:
+        return "N/A"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 MAX_UPLOAD_RETRIES = 3
 RETRY_DELAY = 5
-client = TelegramClient("uploader_bot_session", API_ID, API_HASH)
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 class BoundedDict(dict):
     def __init__(self, maxsize=500):
@@ -404,7 +490,31 @@ def _get_ffprobe() -> str | None:
         _FFPROBE = shutil.which("ffprobe")
     return _FFPROBE
 
+def _resolve_ffmpeg_input(src: str | Path) -> str:
+    """Resolve local filesystem paths so ffmpeg never treats prefixes like 'E:' as a URL protocol."""
+    s = str(src)
+    if s.startswith(("http://", "https://")):
+        return s
+    return str(Path(s).resolve())
+
+def _format_ffmpeg_seek(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}.000"
+
+def _parse_ffmpeg_metadata_output(out: str, meta: dict) -> None:
+    if not meta.get('duration'):
+        m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', out)
+        if m:
+            meta['duration'] = int(int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]))
+    if not meta.get('width') or not meta.get('height'):
+        vm = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', out)
+        if vm:
+            meta['width'], meta['height'] = int(vm[1]), int(vm[2])
+
 def get_video_metadata(filepath):
+    filepath = Path(filepath).resolve()
     meta = {'duration': 0, 'width': 0, 'height': 0}
     ffprobe = _get_ffprobe()
     if ffprobe:
@@ -437,12 +547,7 @@ def get_video_metadata(filepath):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8, errors="replace"
             )
             out = (res.stderr or "") + " " + (res.stdout or "")
-            m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', out)
-            if m:
-                meta['duration'] = int(int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]))
-            vm = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', out)
-            if vm:
-                meta['width'], meta['height'] = int(vm[1]), int(vm[2])
+            _parse_ffmpeg_metadata_output(out, meta)
         except Exception:
             pass
     if not meta['duration'] or not meta['width']:
@@ -462,93 +567,220 @@ def get_video_metadata(filepath):
             pass
     return meta
 
-async def generate_thumbnail(filepath, thumb_path, duration=0):
-    seek = f"00:00:{max(1, duration // 2):02d}.000" if duration > 2 else "00:00:01.000"
-    for ss in (seek, "00:00:00.000"):
+async def _run_ffmpeg_thumbnail(
+    input_src: str | Path,
+    thumb_path: Path,
+    seek: str | None = None,
+    headers: dict | None = None,
+    timeout: float = 15.0,
+) -> tuple[bool, str]:
+    """Extract or convert a single JPEG thumbnail (<=320x320) using resolved paths."""
+    resolved_thumb = Path(thumb_path).resolve()
+    cmd = [_get_ffmpeg(), "-y"]
+    if headers:
+        clean_headers = {
+            k: v for k, v in headers.items()
+            if k.lower() not in ("connection", "accept-encoding", "range")
+        }
+        if clean_headers:
+            cmd.extend(["-headers", "".join(f"{k}: {v}\r\n" for k, v in clean_headers.items())])
+    if seek:
+        cmd.extend(["-ss", seek])
+    cmd.extend([
+        "-i", _resolve_ffmpeg_input(input_src),
+        "-vframes", "1",
+        "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+        "-q:v", "2",
+        str(resolved_thumb),
+    ])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                _get_ffmpeg(), '-y', '-ss', ss, '-i', str(filepath),
-                '-vframes', '1', '-vf', 'scale=320:320:force_original_aspect_ratio=decrease',
-                '-q:v', '2', str(thumb_path),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
             try:
-                await asyncio.wait_for(proc.communicate(), timeout=15.0)
-            except asyncio.TimeoutError:
                 proc.kill()
-            if thumb_path.exists() and thumb_path.stat().st_size > 0:
-                return True
-        except Exception:
-            pass
+                await proc.communicate()
+            except Exception:
+                pass
+            logger.debug(f"ffmpeg thumbnail timed out after {timeout}s for {str(input_src)[:80]}")
+            return False, ""
+        out = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
+        ok = proc.returncode == 0 and resolved_thumb.exists() and resolved_thumb.stat().st_size > 0
+        if not ok:
+            tail = " | ".join(out.strip().splitlines()[-3:])
+            logger.debug(f"ffmpeg thumbnail failed (rc={proc.returncode}): {tail}")
+        return ok, out
+    except Exception as e:
+        logger.debug(f"ffmpeg thumbnail execution error: {e}")
+        return False, ""
+
+async def generate_thumbnail(filepath, thumb_path, duration=0):
+    resolved_thumb = Path(thumb_path).resolve()
+    seeks = (
+        [_format_ffmpeg_seek(max(1, duration // 2)), "00:00:05.000", "00:00:01.000", "00:00:00.000"]
+        if duration > 2
+        else ["00:00:05.000", "00:00:01.000", "00:00:00.000"]
+    )
+    best_bytes = b""
+    for ss in seeks:
+        ok, _ = await _run_ffmpeg_thumbnail(filepath, resolved_thumb, seek=ss, timeout=15.0)
+        if not ok:
+            continue
+        size = resolved_thumb.stat().st_size
+        if size >= 3000:
+            return True
+        if size > len(best_bytes):
+            best_bytes = resolved_thumb.read_bytes()
+    if best_bytes:
+        resolved_thumb.write_bytes(best_bytes)
+        return True
+    return False
+
+async def _fetch_fallback_thumbnail(vid: dict, thumb_path: Path) -> bool:
+    """Download external thumbnail/poster URL and transcode to Telegram-compatible <=320x320 JPEG."""
+    thumb_url = vid.get("thumbnail") or vid.get("poster")
+    if not thumb_url:
+        return False
+    resolved_thumb = Path(thumb_path).resolve()
+    raw_thumb = resolved_thumb.with_suffix(".img")
+    try:
+        parsed = urlparse(thumb_url)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "Referer": f"{parsed.scheme}://{parsed.netloc}/" if parsed.netloc else "",
+        }
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as thumb_client:
+            t_resp = await thumb_client.get(thumb_url)
+            if t_resp.status_code == 200 and len(t_resp.content) > 500:
+                raw_thumb.write_bytes(t_resp.content)
+                ok, _ = await _run_ffmpeg_thumbnail(raw_thumb, resolved_thumb, seek=None, timeout=15.0)
+                if ok and resolved_thumb.stat().st_size <= 200 * 1024:
+                    return True
+    except Exception as e:
+        logger.debug(f"Fallback thumbnail download/convert failed for {thumb_url}: {e}")
+    finally:
+        raw_thumb.unlink(missing_ok=True)
     return False
 
 async def generate_stream_thumbnail_and_metadata(url: str, headers: dict, thumb_path: Path, file_size: int = 0) -> tuple[dict, bool]:
     meta = {'duration': 0, 'width': 0, 'height': 0}
-    has_thumb = False
-    hdr_args = []
-    if headers:
-        hdr_args = ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+    resolved_thumb = Path(thumb_path).resolve()
+    ok, out = await _run_ffmpeg_thumbnail(url, resolved_thumb, seek="00:00:05.000", headers=headers, timeout=20.0)
+    if out:
+        _parse_ffmpeg_metadata_output(out, meta)
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            _get_ffmpeg(), "-y", *hdr_args,
-            "-ss", "00:00:01.000", "-i", url,
-            "-vframes", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-            "-q:v", "2", str(thumb_path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
+    if ok and resolved_thumb.stat().st_size < 3000 and meta['duration'] > 20:
+        alt_thumb = resolved_thumb.with_name(f"{resolved_thumb.stem}_alt.jpg")
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-            out = (stderr.decode(errors="replace") or "") + " " + (stdout.decode(errors="replace") or "")
-            m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', out)
-            if m:
-                meta['duration'] = int(int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]))
-            vm = re.search(r'Stream.*Video:.*?(\d{2,5})x(\d{2,5})', out)
-            if vm:
-                meta['width'], meta['height'] = int(vm[1]), int(vm[2])
-            has_thumb = thumb_path.exists() and thumb_path.stat().st_size > 0
-        except asyncio.TimeoutError:
-            proc.kill()
-    except Exception:
-        pass
+            alt_seek = _format_ffmpeg_seek(min(30, max(15, meta['duration'] // 10)))
+            alt_ok, _ = await _run_ffmpeg_thumbnail(url, alt_thumb, seek=alt_seek, headers=headers, timeout=15.0)
+            if alt_ok and alt_thumb.stat().st_size > resolved_thumb.stat().st_size:
+                alt_thumb.replace(resolved_thumb)
+        finally:
+            alt_thumb.unlink(missing_ok=True)
+    elif not ok and meta['duration'] > 0:
+        fallback_seek = _format_ffmpeg_seek(max(0, meta['duration'] // 2))
+        ok, _ = await _run_ffmpeg_thumbnail(url, resolved_thumb, seek=fallback_seek, headers=headers, timeout=15.0)
+
+    has_thumb = ok and resolved_thumb.exists() and resolved_thumb.stat().st_size > 0
 
     if not has_thumb or meta['duration'] == 0:
-        chunk_path = thumb_path.with_suffix('.part.mp4')
+        chunk_path = resolved_thumb.with_suffix('.part.mp4')
         try:
             chunk_headers = dict(headers or {})
-            chunk_headers["Range"] = "bytes=0-16777215"
+            chunk_headers["Range"] = f"bytes=0-{STREAM_PROBE_BYTES - 1}"
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as hclient:
-                r = await hclient.get(url, headers=chunk_headers)
-                if r.status_code in (200, 206) and len(r.content) > 1024:
-                    chunk_path.write_bytes(r.content)
+                written = 0
+                async with hclient.stream("GET", url, headers=chunk_headers) as r:
+                    if r.status_code in (200, 206):
+                        with open(chunk_path, "wb") as cf:
+                            async for chunk in r.aiter_bytes(65536):
+                                cf.write(chunk)
+                                written += len(chunk)
+                                if written >= STREAM_PROBE_BYTES:
+                                    break
+                if written > 1024:
                     if not has_thumb:
-                        has_thumb = await generate_thumbnail(chunk_path, thumb_path, duration=0)
-                    if meta['duration'] == 0:
+                        has_thumb = await generate_thumbnail(chunk_path, resolved_thumb, duration=meta['duration'])
+                    if meta['duration'] == 0 or not meta['width']:
                         part_meta = get_video_metadata(chunk_path)
-                        if part_meta['duration'] > 0:
+                        if meta['duration'] == 0 and part_meta['duration'] > 0:
                             meta['duration'] = part_meta['duration']
                         if not meta['width']:
                             meta['width'], meta['height'] = part_meta['width'], part_meta['height']
 
-                    if meta['duration'] == 0 and file_size > 18000000:
+                    if meta['duration'] == 0 and file_size > STREAM_PROBE_BYTES + 2097152:
                         tail_headers = dict(headers or {})
                         tail_headers["Range"] = f"bytes={file_size - 2097152}-{file_size - 1}"
-                        tr = await hclient.get(url, headers=tail_headers)
-                        if tr.status_code in (200, 206) and len(tr.content) > 1024:
-                            tail_path = thumb_path.with_suffix('.tail.mp4')
-                            try:
-                                tail_path.write_bytes(tr.content)
+                        tail_path = resolved_thumb.with_suffix('.tail.mp4')
+                        try:
+                            tail_written = 0
+                            async with hclient.stream("GET", url, headers=tail_headers) as tr:
+                                if tr.status_code in (200, 206):
+                                    with open(tail_path, "wb") as tf:
+                                        async for chunk in tr.aiter_bytes(65536):
+                                            tf.write(chunk)
+                                            tail_written += len(chunk)
+                            if tail_written > 1024:
                                 tail_meta = get_video_metadata(tail_path)
                                 if tail_meta['duration'] > 0:
                                     meta['duration'] = tail_meta['duration']
-                            finally:
-                                if tail_path.exists(): tail_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+                        finally:
+                            if tail_path.exists(): tail_path.unlink(missing_ok=True)
+        except Exception as e:
+            logger.debug(f"Stream chunk probe fallback failed: {e}")
         finally:
             if chunk_path.exists(): chunk_path.unlink(missing_ok=True)
 
     return meta, has_thumb
+
+async def _send_video_with_thumb(
+    target_channel_id: int,
+    uploaded_file,
+    clean_name: str,
+    rich_caption: str,
+    metadata: dict,
+    thumb_path: Path | None,
+    has_thumb: bool,
+    topic_id=None,
+):
+    """Send an uploaded video with validated thumbnail, video attributes, and video MIME type."""
+    valid_thumb = None
+    if has_thumb and thumb_path:
+        resolved_thumb = Path(thumb_path).resolve()
+        if resolved_thumb.exists() and resolved_thumb.stat().st_size > 0:
+            valid_thumb = str(resolved_thumb)
+
+    mime_type = mimetypes.guess_type(clean_name)[0]
+    if not mime_type or not mime_type.startswith("video/"):
+        mime_type = "video/mp4"
+
+    attributes = [
+        DocumentAttributeVideo(
+            duration=int(metadata.get('duration') or 0),
+            w=int(metadata.get('width') or (320 if valid_thumb else 0)),
+            h=int(metadata.get('height') or (320 if valid_thumb else 0)),
+            supports_streaming=True,
+        ),
+        DocumentAttributeFilename(file_name=clean_name),
+    ]
+
+    return await client.send_file(
+        target_channel_id,
+        uploaded_file,
+        caption=rich_caption,
+        parse_mode='html',
+        supports_streaming=True,
+        mime_type=mime_type,
+        attributes=attributes,
+        thumb=valid_thumb,
+        reply_to=int(topic_id) if topic_id else None,
+    )
 
 
 def render_album_browser(user_id: int):
@@ -780,21 +1012,13 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 metadata = get_video_metadata(filepath)
                 thumb_path = filepath.with_name(f"{filepath.stem}_{uuid.uuid4().hex[:8]}.jpg")
                 has_thumb = await generate_thumbnail(filepath, thumb_path, duration=metadata.get('duration', 0))
+                if not has_thumb:
+                    has_thumb = await _fetch_fallback_thumbnail(vid, thumb_path)
 
                 ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                 rich_caption = ai_meta["rich_caption"]
                 db_title = ai_meta["db_title"]
                 clean_name = ai_meta.get("file_name") or vid['name']
-
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration=metadata.get('duration', 0),
-                        w=metadata.get('width') or (320 if has_thumb else 0),
-                        h=metadata.get('height') or (320 if has_thumb else 0),
-                        supports_streaming=True
-                    ),
-                    DocumentAttributeFilename(file_name=clean_name)
-                ]
 
                 sent_msg = None
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
@@ -805,18 +1029,13 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 t_pbar.n = current
                                 t_pbar.refresh()
                             with open(filepath, "rb") as f:
-                                uploaded_file = await upload_file(client, f, progress_callback=upload_progress, file_name=clean_name)
-                            sent_msg = await client.send_file(
-                                target_channel_id,
-                                uploaded_file,
-                                caption=rich_caption,
-                                parse_mode='html',
-                                supports_streaming=True,
-                                attributes=attributes,
-                                thumb=str(thumb_path) if has_thumb else None,
-                                file_name=clean_name,
-                                video=True,
-                                reply_to=int(topic_id) if topic_id else None
+                                uploaded_file = await upload_file(
+                                    client, f, progress_callback=upload_progress,
+                                    file_name=clean_name, connection_count=MTPROTO_CONNECTIONS
+                                )
+                            sent_msg = await _send_video_with_thumb(
+                                target_channel_id, uploaded_file, clean_name,
+                                rich_caption, metadata, thumb_path, has_thumb, topic_id=topic_id
                             )
                         break
                     except Exception as e:
@@ -826,20 +1045,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         await asyncio.sleep(RETRY_DELAY)
 
                 # Automated indexing into Supabase if configured
-                if sent_msg and supabase_client:
-                    try:
-                        db_entry = {
-                            "id": str(uuid.uuid4()),
-                            "title": db_title[:150],
-                            "file_id": "mtproto_uploaded",
-                            "message_id": sent_msg.id,
-                            "file_size": file_size,
-                            "upload_date": datetime.now(timezone.utc).isoformat()
-                        }
-                        await asyncio.to_thread(supabase_client.table("media").insert(db_entry).execute)
-                        logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {sent_msg.id})")
-                    except Exception as db_err:
-                        logger.warning(f"Supabase auto-index error: {db_err}")
+                if sent_msg:
+                    await _index_to_supabase(db_title, sent_msg.id, file_size)
 
                 state["uploaded"] += 1
             except Exception as e:
@@ -894,30 +1101,13 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                 thumb_path = temp_dir / f"{vid['id']}_{uuid.uuid4().hex[:8]}_thumb.jpg"
                 meta, has_thumb = await generate_stream_thumbnail_and_metadata(stream_url, stream_headers, thumb_path, file_size=file_size)
 
-                if not has_thumb and vid.get("thumbnail"):
-                    try:
-                        async with httpx.AsyncClient(timeout=15.0) as thumb_client:
-                            t_resp = await thumb_client.get(vid["thumbnail"])
-                            if t_resp.status_code == 200 and len(t_resp.content) > 1000:
-                                thumb_path.write_bytes(t_resp.content)
-                                has_thumb = True
-                    except Exception:
-                        pass
+                if not has_thumb:
+                    has_thumb = await _fetch_fallback_thumbnail(vid, thumb_path)
 
                 ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                 rich_caption = ai_meta["rich_caption"]
                 db_title = ai_meta["db_title"]
                 clean_name = ai_meta.get("file_name") or stream_filename
-
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration=meta.get('duration', 0),
-                        w=meta.get('width') or (320 if has_thumb else 0),
-                        h=meta.get('height') or (320 if has_thumb else 0),
-                        supports_streaming=True
-                    ),
-                    DocumentAttributeFilename(file_name=clean_name)
-                ]
 
                 state["active_uploads"][vid_name] = "<code>[Streaming to Telegram...] 🚀</code>"
 
@@ -935,19 +1125,12 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 url=stream_url,
                                 file_name=clean_name,
                                 headers=stream_headers,
-                                progress_callback=upload_progress
+                                progress_callback=upload_progress,
+                                connection_count=MTPROTO_CONNECTIONS
                             )
-                            sent_msg = await client.send_file(
-                                target_channel_id,
-                                uploaded_file,
-                                caption=rich_caption,
-                                parse_mode='html',
-                                supports_streaming=True,
-                                attributes=attributes,
-                                thumb=str(thumb_path) if has_thumb else None,
-                                file_name=clean_name,
-                                video=True,
-                                reply_to=int(topic_id) if topic_id else None
+                            sent_msg = await _send_video_with_thumb(
+                                target_channel_id, uploaded_file, clean_name,
+                                rich_caption, meta, thumb_path, has_thumb, topic_id=topic_id
                             )
                         break
                     except Exception as e:
@@ -958,20 +1141,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         logger.warning(f"Stream attempt {attempt} failed for {vid_name}: {e}. Retrying in {RETRY_DELAY}s...")
                         await asyncio.sleep(RETRY_DELAY)
 
-                if sent_msg and supabase_client:
-                    try:
-                        db_entry = {
-                            "id": str(uuid.uuid4()),
-                            "title": db_title[:150],
-                            "file_id": "mtproto_uploaded",
-                            "message_id": sent_msg.id,
-                            "file_size": file_size,
-                            "upload_date": datetime.now(timezone.utc).isoformat()
-                        }
-                        await asyncio.to_thread(supabase_client.table("media").insert(db_entry).execute)
-                        logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {sent_msg.id})")
-                    except Exception as db_err:
-                        logger.warning(f"Supabase auto-index error: {db_err}")
+                if sent_msg:
+                    await _index_to_supabase(db_title, sent_msg.id, file_size)
 
                 state["uploaded"] += 1
                 state["downloaded"] += 1
@@ -987,7 +1158,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
         if ENABLE_STREAM_UPLOAD:
             # Direct RAM-buffered streaming pipeline (zero disk usage for media files)
-            stream_sem = asyncio.Semaphore(2)
+            stream_sem = asyncio.Semaphore(STREAM_CONCURRENCY)
             async def bounded_stream(vid):
                 async with stream_sem:
                     await stream_pipeline_worker(vid)
@@ -1051,20 +1222,12 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         metadata = get_video_metadata(filepath)
                         thumb_path = filepath.with_name(f"{filepath.stem}_{uuid.uuid4().hex[:8]}.jpg")
                         has_thumb = await generate_thumbnail(filepath, thumb_path, duration=metadata.get('duration', 0))
+                        if not has_thumb:
+                            has_thumb = await _fetch_fallback_thumbnail(vid, thumb_path)
                         ai_meta = await generate_ai_caption(vid, service, cur_user_id)
                         rich_caption = ai_meta["rich_caption"]
                         db_title = ai_meta["db_title"]
                         clean_name = ai_meta.get("file_name") or vid['name']
-
-                        attributes = [
-                            DocumentAttributeVideo(
-                                duration=metadata.get('duration', 0),
-                                w=metadata.get('width') or (320 if has_thumb else 0),
-                                h=metadata.get('height') or (320 if has_thumb else 0),
-                                supports_streaming=True
-                            ),
-                            DocumentAttributeFilename(file_name=clean_name)
-                        ]
 
                         sent_msg = None
                         for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
@@ -1075,18 +1238,13 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                         t_pbar.n = current
                                         t_pbar.refresh()
                                     with open(filepath, "rb") as f:
-                                        uploaded_file = await upload_file(client, f, progress_callback=upload_progress, file_name=clean_name)
-                                    sent_msg = await client.send_file(
-                                        target_channel_id,
-                                        uploaded_file,
-                                        caption=rich_caption,
-                                        parse_mode='html',
-                                        supports_streaming=True,
-                                        attributes=attributes,
-                                        thumb=str(thumb_path) if has_thumb else None,
-                                        file_name=clean_name,
-                                        video=True,
-                                        reply_to=int(topic_id) if topic_id else None
+                                        uploaded_file = await upload_file(
+                                            client, f, progress_callback=upload_progress,
+                                            file_name=clean_name, connection_count=MTPROTO_CONNECTIONS
+                                        )
+                                    sent_msg = await _send_video_with_thumb(
+                                        target_channel_id, uploaded_file, clean_name,
+                                        rich_caption, metadata, thumb_path, has_thumb, topic_id=topic_id
                                     )
                                 break
                             except Exception as e:
@@ -1095,20 +1253,8 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                                 logger.warning(f"Upload attempt {attempt} failed for {vid['name']}: {e}. Retrying in {RETRY_DELAY}s...")
                                 await asyncio.sleep(RETRY_DELAY)
 
-                        if sent_msg and supabase_client:
-                            try:
-                                db_entry = {
-                                    "id": str(uuid.uuid4()),
-                                    "title": db_title[:150],
-                                    "file_id": "mtproto_uploaded",
-                                    "message_id": sent_msg.id,
-                                    "file_size": file_size,
-                                    "upload_date": datetime.now(timezone.utc).isoformat()
-                                }
-                                await asyncio.to_thread(supabase_client.table("media").insert(db_entry).execute)
-                                logger.info(f"Indexed to Supabase: {db_title[:60]} (Msg ID: {sent_msg.id})")
-                            except Exception as db_err:
-                                logger.warning(f"Supabase auto-index error: {db_err}")
+                        if sent_msg:
+                            await _index_to_supabase(db_title, sent_msg.id, file_size)
 
                         state["uploaded"] += 1
                     except Exception as e:
@@ -1126,7 +1272,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         upload_queue.task_done()
 
             upload_tasks = [asyncio.create_task(upload_worker()) for _ in range(1)]
-            dl_sem = asyncio.Semaphore(3)
+            dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
             async def bounded_download(vid):
                 async with dl_sem:
                     await download_worker(vid)
@@ -1327,13 +1473,7 @@ async def callback_handler(event):
             await event.answer("Temp folder is already empty.")
 
     elif data == "stats_info":
-        total_idx = "N/A"
-        if supabase_client:
-            try:
-                res = await asyncio.to_thread(lambda: supabase_client.table("media").select("id", count="exact").execute())
-                total_idx = str(res.count or 0)
-            except Exception:
-                pass
+        total_idx = await _get_supabase_media_count()
         stat_text = (
             "📊 <b>Uploader & Storage Overview</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2151,13 +2291,7 @@ async def bunkr_command_handler(event):
 @client.on(events.NewMessage(pattern=r"^/stats$"))
 async def stats_command_handler(event):
     if not await check_admin_or_notify(event): return
-    total_idx = "N/A"
-    if supabase_client:
-        try:
-            res = await asyncio.to_thread(lambda: supabase_client.table("media").select("id", count="exact").execute())
-            total_idx = str(res.count or 0)
-        except Exception:
-            pass
+    total_idx = await _get_supabase_media_count()
     stat_text = (
         "📊 <b>Uploader & Storage Overview</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"

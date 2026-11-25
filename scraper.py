@@ -499,6 +499,14 @@ async def fetch_bunkr_album(domain: str, album_id: str, page_range: tuple[int, i
                 items_found += 1
 
                 card = a_link.find_parent('div') or a_link
+                item_box = a_link.find_parent(class_=re.compile(r'theItem|group/item')) or (card.find_parent('div') if card else None)
+                thumb_url = None
+                if item_box:
+                    thumb_img = item_box.find('img', class_=re.compile(r'grid-images_box-img|theImage'))
+                    if thumb_img:
+                        raw_src = thumb_img.get('data-src') or thumb_img.get('src')
+                        if raw_src and not raw_src.endswith('.svg'):
+                            thumb_url = urljoin(f"https://{domain}", raw_src)
                 title = ""
                 name_elem = card.find(class_=re.compile(r'(text-subs|theName|truncate|font-semibold)'))
                 if name_elem:
@@ -517,6 +525,8 @@ async def fetch_bunkr_album(domain: str, album_id: str, page_range: tuple[int, i
                     "service": "bunkr",
                     "bunkr_f_url": full_url,
                     "name": sanitize(title),
+                    "thumbnail": thumb_url,
+                    "poster": thumb_url,
                     "file": {
                         "path": href,
                         "name": sanitize(title)
@@ -534,6 +544,12 @@ async def fetch_bunkr_album(domain: str, album_id: str, page_range: tuple[int, i
                     if slug in seen_slugs:
                         continue
                     seen_slugs.add(slug)
+                    thumb_img = item_div.find('img')
+                    thumb_url = None
+                    if thumb_img:
+                        raw_src = thumb_img.get('data-src') or thumb_img.get('src')
+                        if raw_src and not raw_src.endswith('.svg'):
+                            thumb_url = urljoin(f"https://{domain}", raw_src)
                     name_elem = item_div.find(class_='theName')
                     title = name_elem.text.strip() if name_elem else item_div.get('title', '')
                     if not title:
@@ -543,6 +559,8 @@ async def fetch_bunkr_album(domain: str, album_id: str, page_range: tuple[int, i
                         "service": "bunkr",
                         "bunkr_f_url": urljoin(f"https://{domain}", href),
                         "name": sanitize(title),
+                        "thumbnail": thumb_url,
+                        "poster": thumb_url,
                         "file": {
                             "path": href,
                             "name": sanitize(title)
@@ -2342,6 +2360,8 @@ def extract_video_urls(domain: str, posts: list[dict]) -> list[dict]:
                         "service": "bunkr",
                         "title": post_title.strip() or name,
                         "content": post_content.strip()[:300],
+                        "thumbnail": p.get("thumbnail") or p.get("poster"),
+                        "poster": p.get("poster") or p.get("thumbnail"),
                         "user": creator_id
                     })
                     urls.add(f_url)

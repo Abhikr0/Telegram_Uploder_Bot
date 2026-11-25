@@ -25,9 +25,12 @@ def sanitize_filename(name: str, ext: str = ".mp4") -> str:
     clean = re.sub(r"\s+", " ", clean).strip(" ._")
     if not clean:
         clean = "video"
+    max_stem = max(1, 80 - len(ext))
+    if len(clean) + len(ext) > 80:
+        clean = clean[:max_stem].rstrip(" ._") or "video"
     if not clean.lower().endswith(ext.lower()):
         clean = f"{clean}{ext}"
-    return clean[:80]
+    return clean
 
 def _sanitize_hashtag(tag: str) -> str:
     """Sanitize a string into a valid Telegram hashtag."""
