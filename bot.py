@@ -89,6 +89,7 @@ ENABLE_STREAM_UPLOAD = os.getenv(
 ).lower() in ("true", "1", "yes")
 STREAM_CONCURRENCY = _env_int("STREAM_CONCURRENCY", 1 if IS_TERMUX else 2)
 DOWNLOAD_CONCURRENCY = _env_int("DOWNLOAD_CONCURRENCY", 2 if IS_TERMUX else 3)
+UPLOAD_CONCURRENCY = _env_int("UPLOAD_CONCURRENCY", 1 if IS_TERMUX else 2)
 MTPROTO_CONNECTIONS = _env_int("MTPROTO_CONNECTIONS", 2 if IS_TERMUX else 4)
 MTPROTO_PIPELINE_DEPTH = _env_int("MTPROTO_PIPELINE_DEPTH", 2)
 HTTP_STREAM_CONNECTIONS = _env_int("HTTP_STREAM_CONNECTIONS", 3 if IS_TERMUX else 6)
@@ -1291,7 +1292,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
                         await BAR_MANAGER.release_pos(pos)
                         upload_queue.task_done()
 
-            upload_tasks = [asyncio.create_task(upload_worker()) for _ in range(1)]
+            upload_tasks = [asyncio.create_task(upload_worker()) for _ in range(UPLOAD_CONCURRENCY)]
             dl_sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
             async def bounded_download(vid):
                 async with dl_sem:
@@ -1299,7 +1300,7 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
             await asyncio.gather(*[bounded_download(v) for v in videos])
 
-            for _ in range(2):
+            for _ in range(len(upload_tasks)):
                 await upload_queue.put(None)
             await asyncio.gather(*upload_tasks)
 
