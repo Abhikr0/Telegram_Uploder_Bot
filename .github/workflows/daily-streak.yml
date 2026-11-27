@@ -1,0 +1,36 @@
+name: Daily Streak
+
+on:
+  schedule:
+    # 12:15 UTC (17:45 IST) avoids midnight queue spikes and lands on the same day in UTC and IST.
+    - cron: '15 12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  daily-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Create and push daily commit
+        run: |
+          git config user.name "Abhishek"
+          git config user.email "rockavishek4@gmail.com"
+
+          messages=(
+            "chore: daily streak check-in"
+            "chore: keep momentum going"
+            "chore: daily activity ping"
+            "chore: routine check-in"
+            "chore: daily heartbeat"
+          )
+          msg="${messages[$((RANDOM % ${#messages[@]}))]}"
+
+          git commit --allow-empty -m "$msg ($(date -u +%F))"
+          git push origin HEAD:main
