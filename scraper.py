@@ -302,27 +302,9 @@ def parse_media_url(url: str) -> Tuple[Optional[str], Optional[str], Optional[st
 
     # 4. Support PimpBunny URLs (let direct .mp4/.m3u8 URLs fall through to direct media handler)
     if "pimpbunny" in domain_lower and not is_direct_media_url(url):
-        # Single video page: /videos/<slug> (excluding paginated /videos/2/)
-        single_match = re.match(r"^/videos/([^/?#]+)", clean_path)
-        if single_match and not single_match.group(1).isdigit():
-            slug = single_match.group(1)
-            return domain, "pimpbunny", slug, slug
+        from pimpbunny_adapter import parse_pimpbunny_url
 
-        # Catalog / listing: /categories/<slug>, /onlyfans-creators/<slug>, /tags/<slug>
-        list_match = re.match(r"^/(categories|onlyfans-creators|tags)/([^/?#]+)", clean_path)
-        if list_match and not list_match.group(2).isdigit():
-            section, slug = list_match.group(1), list_match.group(2)
-            return domain, "pimpbunny", f"{section}/{slug}", None
-
-        # Section root / pagination (/videos/2/, /categories/2/, /2/, /)
-        sec_match = re.match(r"^/(videos|categories|onlyfans-creators|tags)(?:/\d+)?$", clean_path)
-        if sec_match:
-            return domain, "pimpbunny", sec_match.group(1), None
-
-        if clean_path in ("", "/") or re.match(r"^/\d+$", clean_path):
-            return domain, "pimpbunny", "home", None
-
-        return domain, "pimpbunny", clean_path.strip("/"), None
+        return parse_pimpbunny_url(url)
 
     # 5. Direct Media File on ANY domain
     if is_direct_media_url(url):
@@ -2037,7 +2019,10 @@ async def extract_native_video(html: str, page_url: str) -> dict:
 
     # Direct Regex Fallback
     if not video_url:
-        direct_matches = re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|webm)[^\s"\'<>]*', html)
+        direct_matches = re.findall(
+            r'https?://(?:(?!(?:&quot;|&apos;|&#34;|&#39;))[^\s"\'<>])+\.(?:mp4|m3u8|webm)(?:(?!(?:&quot;|&apos;|&#34;|&#39;))[^\s"\'<>])*',
+            html,
+        )
         valid = [m for m in direct_matches if not any(x in m.lower() for x in ["doubleclick", "googleads", "analytics", "pixel"])]
         if valid:
             video_url = valid[0]
@@ -2093,6 +2078,12 @@ async def extract_universal_video(page_url: str, client: httpx.AsyncClient = Non
             logger.warning(f"Anti-bot challenge (HTTP {resp.status_code}) blocking {page_url}")
             return {}
         if resp.status_code == 200:
+            if "pimpbunny" in page_url.lower():
+                from pimpbunny_adapter import _parse_pimpbunny_video_html
+
+                pb = _parse_pimpbunny_video_html(str(resp.url), resp.text)
+                if is_direct_media_url(pb.get("url", "")):
+                    return pb
             native_data = await extract_native_video(resp.text, page_url)
             if native_data.get("url"):
                 srv = urlparse(page_url).netloc.replace("www.", "").split(".")[0] or "web"

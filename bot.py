@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import html
 import asyncio
 import logging
 import shutil
@@ -221,6 +222,67 @@ BAR_MANAGER = BarPositionManager()
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _esc(val) -> str:
+    """Escape dynamic text for Telegram HTML parse mode."""
+    return html.escape(str(val or ""), quote=False)
+
+def _shorten_url(url: str, max_len: int = 46) -> str:
+    """Trim scheme and long URLs cleanly for compact UI cards."""
+    clean = re.sub(r"^https?://", "", str(url or "")).rstrip("/")
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 1].rstrip() + "…"
+
+def _telegram_channel_url(chat_id, topic_id=None) -> str | None:
+    """Build a t.me/c/ link for supergroups/channels (-100...), optionally targeting a topic."""
+    if not chat_id or not str(chat_id).startswith("-100"):
+        return None
+    clean_id = str(abs(int(chat_id)))[3:]
+    if topic_id:
+        return f"https://t.me/c/{clean_id}/{int(topic_id)}"
+    return f"https://t.me/c/{clean_id}"
+
+def _get_temp_cache_mb() -> float:
+    """Return total temporary cache size in MB."""
+    if not os.path.exists(DOWNLOAD_DIR):
+        return 0.0
+    try:
+        total_b = sum(f.stat().st_size for f in Path(DOWNLOAD_DIR).glob("**/*") if f.is_file())
+        return round(total_b / (1024 * 1024), 1)
+    except Exception:
+        return 0.0
+
+async def _render_or_edit(event, text: str, buttons=None):
+    """Edit the existing message for callback events, or send a new response otherwise."""
+    if isinstance(event, events.CallbackQuery.Event):
+        try:
+            return await event.edit(text, parse_mode='html', buttons=buttons, link_preview=False)
+        except errors.MessageNotModifiedError:
+            return None
+        except Exception:
+            pass
+    return await event.respond(text, parse_mode='html', buttons=buttons, link_preview=False)
+
+def _extract_target_and_topic(event) -> tuple[int, int | None]:
+    """Resolve upload destination chat and forum topic from a command event."""
+    dest_id = STORAGE_CHANNEL_ID
+    topic_id = None
+    if getattr(event, "is_group", False):
+        dest_id = event.chat_id
+        reply_to = getattr(getattr(event, "message", None), "reply_to", None)
+        if reply_to:
+            topic_id = getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None)
+    return dest_id, topic_id
+
+async def _resolve_forum_dest(event) -> int:
+    """Resolve the target forum group ID from the current chat or configured storage channels."""
+    if getattr(event, "is_group", False):
+        return event.chat_id
+    for cid in STORAGE_CHANNELS:
+        if await is_forum_chat(cid):
+            return cid
+    return STORAGE_CHANNEL_ID
+
 def is_admin(user_id):
     try:
         load_dotenv(override=True)
@@ -234,10 +296,10 @@ async def check_admin_or_notify(event):
     if is_admin(event.sender_id):
         return True
     await event.respond(
-        f"⛔ <b>Access Restricted</b>\n\n"
-        f"Your Telegram User ID is: <code>{event.sender_id}</code>\n"
-        f"To enable access, add this ID to <code>ADMIN_IDS</code> in <code>.env</code> or ask the bot administrator.",
-        parse_mode='html'
+        "⛔ <b>Access Restricted</b>\n"
+        f"<blockquote>Your User ID: <code>{event.sender_id}</code>\n"
+        "Ask the administrator to add it to <code>ADMIN_IDS</code>.</blockquote>",
+        parse_mode='html',
     )
     return False
 
@@ -410,7 +472,7 @@ async def create_forum_topic_helper(chat_id, title):
                 if "not enough rights" in desc.lower():
                     raise Exception(
                         "Bot lacks 'Manage Topics' admin permission in this group. "
-                        "Please go to Group Settings > Administrators > Infinty > toggle 'Manage Topics' ON and tap Save."
+                        "Enable 'Manage Topics' for the bot in Group Settings > Administrators."
                     )
                 logger.warning(f"Bot API createForumTopic returned error: {desc}")
     except Exception as e:
@@ -454,7 +516,7 @@ async def create_forum_topic_helper(chat_id, title):
         if "can't write" in str(e).lower() or "rights" in str(e).lower():
             raise Exception(
                 "Bot lacks 'Manage Topics' admin permission in this group. "
-                "Please go to Group Settings > Administrators > Infinty > toggle 'Manage Topics' ON and tap Save."
+                "Enable 'Manage Topics' for the bot in Group Settings > Administrators."
             )
         raise e
 
@@ -467,12 +529,12 @@ def format_bytes(size_bytes: int) -> str:
 
 def get_progress_bar(current, total):
     if not total or total <= 0:
-        return f"<code>[{'🟦' * 5}{'⬜' * 5}] {format_bytes(current)}</code>"
+        return f"<code>[█████░░░░░] {format_bytes(current)}</code>"
     current = min(current, total)
     percentage = current / total
     done = int(percentage * 10)
     remain = 10 - done
-    return f"<code>[{'🟦' * done}{'⬜' * remain}] {percentage:.1%} ({format_bytes(current)} / {format_bytes(total)})</code>"
+    return f"<code>[{'█' * done}{'░' * remain}] {percentage:.0%} · {format_bytes(current)}/{format_bytes(total)}</code>"
 
 _FFMPEG: str | None = None
 _FFPROBE: str | None = None
@@ -787,7 +849,7 @@ async def _send_video_with_thumb(
 
 
 def render_album_browser(user_id: int):
-    """Render the paginated album files selector with checkbox toggles and rich field previews."""
+    """Render the paginated album files selector with checkbox toggles and clean controls."""
     info = USER_STATES.get(user_id, {})
     url = info.get('url', '')
     videos = info.get('videos', [])
@@ -809,33 +871,24 @@ def render_album_browser(user_id: int):
         name = vid.get("name") or vid.get("title") or f"File_{i+1}"
         service = vid.get("service") or "media"
         checked = "✅" if i in selected else "◻️"
-        file_lines.append(f"{checked} <b>#{i+1}</b> <code>{name[:38]}</code> ({service})")
+        file_lines.append(f"{checked} <b>#{i+1}</b> <code>{_esc(name[:36])}</code> <i>({_esc(service)})</i>")
 
     file_preview = "\n".join(file_lines) if file_lines else "<i>No files on this page.</i>"
 
     text = (
-        f"📁 <b>Album File Browser (Page {page + 1}/{total_pages})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Source:</b> <code>{url[:55]}...</code>\n"
-        f"• <b>Total Files:</b> {total_items} items\n"
-        f"• <b>Selected:</b> <b>{len(selected)}</b> / {total_items} items\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{file_preview}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Tap an item below to toggle selection:</i>"
+        f"<b>📋 Select Files</b>  ·  Page {page + 1}/{total_pages}\n"
+        f"<blockquote><b>Source:</b> <code>{_esc(_shorten_url(url, 44))}</code>\n"
+        f"<b>Selected:</b> <b>{len(selected)}</b> / {total_items} items</blockquote>\n\n"
+        f"{file_preview}"
     )
 
     buttons = []
-    # Video rows with checkboxes
     for i in range(start_idx, end_idx):
         vid = videos[i]
         name = vid.get("name") or vid.get("title") or f"File_{i+1}"
-        display_name = name[:26]
         checked = "✅" if i in selected else "◻️"
-        btn_text = f"{checked} #{i+1} {display_name}"
-        buttons.append([Button.inline(btn_text, f"sel_tog:{i}".encode())])
+        buttons.append([Button.inline(f"{checked} #{i+1} {name[:28]}", f"sel_tog:{i}".encode())])
 
-    # Navigation row
     nav_row = []
     if page > 0:
         nav_row.append(Button.inline("◀️ Prev", f"sel_pg:{page - 1}".encode()))
@@ -844,26 +897,23 @@ def render_album_browser(user_id: int):
         nav_row.append(Button.inline("Next ▶️", f"sel_pg:{page + 1}".encode()))
     buttons.append(nav_row)
 
-    # Page controls & Select All
     buttons.append([
-        Button.inline(f"✅ Select All ({total_items})", b"sel_all_items"),
-        Button.inline("🔘 Select Page", f"sel_all_pg:{page}".encode()),
-        Button.inline("🔄 Clear", b"sel_clear")
-    ])
-
-    # Download actions
-    buttons.append([
-        Button.inline(f"📥 Download Selected ({len(selected)})", b"sel_confirm")
+        Button.inline(f"☑️ All ({total_items})", b"sel_all_items"),
+        Button.inline("☑️ Page", f"sel_all_pg:{page}".encode()),
+        Button.inline("🔄 Clear", b"sel_clear"),
     ])
     buttons.append([
-        Button.inline(f"🚀 Download All ({total_items})", b"sel_all_download"),
-        Button.inline("🏠 Menu", b"cancel_flow")
+        Button.inline(f"⬇️ Download Selected ({len(selected)})", b"sel_confirm"),
+    ])
+    buttons.append([
+        Button.inline(f"⚡ All ({total_items})", b"sel_all_download"),
+        Button.inline("✕ Cancel", b"cancel_flow"),
     ])
 
     return text, buttons
 
 
-async def download_and_upload(event, url, page_range_str, target_channel_id=None, selected_videos=None, topic_id=None):
+async def download_and_upload(event, url, page_range_str, target_channel_id=None, selected_videos=None, topic_id=None, status_msg=None):
     user_id = event.sender_id
     LAST_TASK_INFO[user_id] = {
         'url': url,
@@ -873,43 +923,69 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
         'topic_id': topic_id
     }
     RUNNING_TASKS[user_id] = asyncio.current_task()
-    
+
     if target_channel_id is None:
         target_channel_id = STORAGE_CHANNEL_ID
 
-    status_msg = None
     temp_dir = None
     status_task = None
+
+    async def _set_status(msg_text: str, buttons=None):
+        nonlocal status_msg
+        if status_msg is None:
+            status_msg = await event.respond(msg_text, parse_mode='html', buttons=buttons, link_preview=False)
+        else:
+            try:
+                await status_msg.edit(msg_text, parse_mode='html', buttons=buttons, link_preview=False)
+            except errors.MessageNotModifiedError:
+                pass
+            except Exception:
+                status_msg = await event.respond(msg_text, parse_mode='html', buttons=buttons, link_preview=False)
+
     try:
         domain, service, cur_user_id, post_id = parse_media_url(url)
-        if not domain: 
-            await event.respond("❌ <b>Invalid URL.</b>\nSupported formats: Viralchut, Coomer creator/post URLs, Bunkr album/video URLs.", parse_mode='html')
+        if not domain:
+            await _set_status(
+                "❌ <b>Invalid URL</b>\nSend a valid media, album, or creator link.",
+                buttons=[[Button.inline("🏠 Menu", b"main_menu")]],
+            )
             return
-            
+
         page_range = parse_page_range(page_range_str) if page_range_str else None
-        
+
         safe_folder = re.sub(r'[^a-zA-Z0-9_-]', '_', f"{service}_{cur_user_id}_{event.id}")[:64]
         temp_dir = Path(DOWNLOAD_DIR) / safe_folder
         temp_dir.mkdir(parents=True, exist_ok=True)
 
+        cancel_markup = [[Button.inline("🛑 Cancel Task", b"cancel_task")]]
+
         if selected_videos:
             videos = selected_videos
-            status_msg = await event.respond(f"📦 <b>Starting download of {len(videos)} selected files...</b>", parse_mode='html')
+            await _set_status(
+                f"<b>📦 Preparing Pipeline</b>\n<blockquote>Queued <b>{len(videos)}</b> selected item(s)…</blockquote>",
+                buttons=cancel_markup,
+            )
         else:
-            status_msg = await event.respond(f"🔍 <b>Scraping:</b> {service}/{cur_user_id}...", parse_mode='html')
-            
+            await _set_status(
+                f"<b>🔍 Scanning Source</b>\n<blockquote><code>{_esc(service)}</code> · <code>{_esc(cur_user_id)}</code></blockquote>",
+                buttons=cancel_markup,
+            )
+
             posts = await fetch_all_posts(domain, service, cur_user_id, page_range, post_id=post_id)
             if not posts:
-                await status_msg.edit("❌ No posts found.")
+                await _set_status("❌ <b>No posts found.</b>", buttons=[[Button.inline("🏠 Menu", b"main_menu")]])
                 return
-                
+
             videos = extract_video_urls(domain, posts)
             if not videos:
-                await status_msg.edit("⚠ No videos found in posts.")
+                await _set_status("⚠️ <b>No downloadable videos found.</b>", buttons=[[Button.inline("🏠 Menu", b"main_menu")]])
                 return
-                
-            await status_msg.edit(f"📦 Found {len(videos)} videos. Starting parallel optimized download & upload...")
-        
+
+            await _set_status(
+                f"<b>📦 Starting Pipeline</b>\n<blockquote>Found <b>{len(videos)}</b> video(s)…</blockquote>",
+                buttons=cancel_markup,
+            )
+
         # Shared progress state
         state = {
             "total": len(videos),
@@ -922,41 +998,46 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
             "running": True
         }
 
-        cancel_button = [Button.inline("🛑 Cancel Task", b"cancel_task")]
-
         # Background status updater (throttled to avoid FloodWait)
         async def status_updater():
             last_text = ""
+            mode_label = "⚡ Stream" if ENABLE_STREAM_UPLOAD else "💾 Disk"
             while state["running"]:
                 processed = state["uploaded"] + state["skipped"] + state["failed"]
-                text = (
-                    f"📊 <b>Pipeline Progress ({'⚡ RAM Stream' if ENABLE_STREAM_UPLOAD else '💾 Disk Pipeline'}):</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📥 <b>Processed:</b> {state['downloaded']}/{state['total']} videos\n"
-                    f"📤 <b>Uploaded:</b> {state['uploaded']}/{state['total']} videos\n"
+                summary = (
+                    f"<b>Done:</b> {processed}/{state['total']}  ·  "
+                    f"<b>Fetched:</b> {state['downloaded']}  ·  "
+                    f"<b>Uploaded:</b> {state['uploaded']}"
                 )
                 if state["skipped"] > 0:
-                    text += f"⏩ <b>Skipped:</b> {state['skipped']}\n"
+                    summary += f"  ·  <b>Skipped:</b> {state['skipped']}"
                 if state["failed"] > 0:
-                    text += f"❌ <b>Failed:</b> {state['failed']}\n"
-                text += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    summary += f"  ·  <b>Failed:</b> {state['failed']}"
+
+                lines = [
+                    f"<b>📊 Upload Progress</b>  ·  {mode_label}",
+                    f"<blockquote>{summary}</blockquote>",
+                ]
 
                 active_dl = list(state["active_downloads"].items())
                 if active_dl:
-                    text += "<b>📥 Active Downloads:</b>\n"
+                    lines.append("")
+                    lines.append("<b>📥 Downloading</b>")
                     for v_name, pbar in active_dl[:3]:
-                        text += f"• <code>{v_name[:24]}...</code>\n  {pbar}\n"
-                    text += "\n"
+                        lines.append(f"• <code>{_esc(v_name[:28])}</code>\n  {pbar}")
 
                 active_up = list(state["active_uploads"].items())
                 if active_up:
-                    text += "<b>🚀 Active Uploads:</b>\n"
+                    lines.append("")
+                    lines.append("<b>🚀 Uploading</b>")
                     for v_name, pbar in active_up[:3]:
-                        text += f"• <code>{v_name[:24]}...</code>\n  {pbar}\n"
+                        lines.append(f"• <code>{_esc(v_name[:28])}</code>\n  {pbar}")
 
-                if text != last_text:
+                text = "\n".join(lines)
+
+                if text != last_text and status_msg is not None:
                     try:
-                        await status_msg.edit(text, parse_mode='html', buttons=cancel_button)
+                        await status_msg.edit(text, parse_mode='html', buttons=cancel_markup, link_preview=False)
                         last_text = text
                     except errors.FloodWaitError as fwe:
                         await asyncio.sleep(fwe.seconds)
@@ -1312,31 +1393,44 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
             except (asyncio.CancelledError, Exception):
                 pass
 
-        final_text = (
-            f"🏁 <b>Task Completed!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📥 <b>Downloaded:</b> {state['downloaded']}/{len(videos)} videos\n"
-            f"✅ <b>Uploaded:</b> {state['uploaded']}/{len(videos)} videos"
-        )
+        final_lines = [
+            "<b>🏁 Task Completed!</b>",
+            f"<blockquote><b>Downloaded:</b> {state['downloaded']}/{len(videos)}",
+            f"<b>Uploaded:</b> {state['uploaded']}/{len(videos)}",
+        ]
         if state['skipped'] > 0:
-            final_text += f"\n⏩ <b>Skipped:</b> {state['skipped']}"
+            final_lines.append(f"<b>Skipped:</b> {state['skipped']}")
         if state['failed'] > 0:
-            final_text += f"\n❌ <b>Failed:</b> {state['failed']}"
-        final_text += "\n━━━━━━━━━━━━━━━━━━━━━━━━"
+            final_lines.append(f"<b>Failed:</b> {state['failed']}")
+        final_lines[-1] += "</blockquote>"
+        final_text = "\n".join(final_lines)
 
-        await status_msg.edit(final_text, parse_mode='html')
+        done_row = []
+        ch_url = _telegram_channel_url(target_channel_id, topic_id)
+        if ch_url:
+            done_row.append(Button.url("📂 View Uploads", ch_url))
+        done_row.append(Button.inline("🏠 Menu", b"main_menu"))
+        await _set_status(final_text, buttons=[done_row])
 
     except asyncio.CancelledError:
         logger.info(f"Task for {url} was cancelled.")
         if status_msg:
             try:
-                await status_msg.edit(f"🛑 <b>Task Cancelled.</b>\n🔗 {url}", parse_mode='html')
+                await status_msg.edit(
+                    f"<b>🛑 Task Cancelled</b>\n<blockquote><code>{_esc(_shorten_url(url, 52))}</code></blockquote>",
+                    parse_mode='html',
+                    buttons=[[Button.inline("🔄 Retry", b"resume_last"), Button.inline("🏠 Menu", b"main_menu")]],
+                    link_preview=False,
+                )
             except Exception:
                 pass
     except Exception as e:
         logger.error(f"Global error in download_and_upload: {e}")
         try:
-            await event.respond(f"❌ <b>Error:</b> {e}", parse_mode='html')
+            await _set_status(
+                f"❌ <b>Pipeline Error</b>\n<blockquote><code>{_esc(e)}</code></blockquote>",
+                buttons=[[Button.inline("🏠 Menu", b"main_menu")]],
+            )
         except Exception:
             pass
     finally:
@@ -1351,88 +1445,183 @@ async def download_and_upload(event, url, page_range_str, target_channel_id=None
 
 # ── Commands & Menu ──────────────────────────────────────────────────────────
 
-@client.on(events.NewMessage(pattern=r"^/start$"))
-async def start_handler(event):
-    if not await check_admin_or_notify(event): return
-    
-    # Calculate quick stats
+def _build_main_menu(user_id: int) -> tuple[str, list]:
     active_count = len(RUNNING_TASKS)
-    temp_size_mb = 0
-    if os.path.exists(DOWNLOAD_DIR):
-        try:
-            total_b = sum(f.stat().st_size for f in Path(DOWNLOAD_DIR).glob('**/*') if f.is_file())
-            temp_size_mb = round(total_b / (1024 * 1024), 1)
-        except Exception:
-            pass
+    status_badge = f"🟡 Busy ({active_count} active)" if active_count else "🟢 Ready"
+    mode_badge = "⚡ Stream" if ENABLE_STREAM_UPLOAD else "💾 Disk"
 
     text = (
-        "✨ <b>Ultimate Media Downloader & Archiver</b> ✨\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Welcome! I scrape, download, and archive media directly into Telegram storage with MTProto multi-chunk speeds.\n\n"
-        "⚡ <b>Supported Sources:</b>\n"
-        "• <b>XMoviesForYou:</b> HD Videos, Studios, Pornstars, Categories, Playlists (<code>https://xmoviesforyou.com/</code>)\n"
-        "• <b>UXSeries:</b> Actresses, Series, Episodes, Platforms (<code>https://uxseries.co/</code>)\n"
-        "• <b>HDMaal:</b> Models, OTT, Web Series (<code>https://hdmaal.movie/</code>)\n"
-        "• <b>Universal Web Scraper & Crawler:</b> Any website, tube, blog, gallery, or direct video\n"
-        "• <b>Viralchut:</b> Single videos, Categories, Tags, Search, Latest\n"
-        "• <b>Bunkr:</b> Albums (<code>/a/</code>) & Videos (<code>/v/</code>, <code>/f/</code>)\n"
-        "• <b>PimpBunny:</b> Videos, Categories, Models, Tags (<code>https://pimpbunny.com/</code>)• <b>Coomer / Kemono:</b> Creator profiles & single posts\n\n"
-        "📊 <b>Current System Overview:</b>\n"
-        f"• <b>Status:</b> 🟢 Online & MTProto Ready\n"
-        f"• <b>Storage Channels:</b> <code>{', '.join(str(c) for c in STORAGE_CHANNELS)}</code>\n"
-        f"• <b>Active Tasks:</b> <code>{active_count}</code>\n"
-        f"• <b>Temp Cache:</b> <code>{temp_size_mb} MB</code>\n"
-        f"• <b>Supabase Auto-Index:</b> {'🟢 Enabled' if supabase_client else '⚪ Disabled'}\n"
-        f"• <b>Mistral AI:</b> {'⚡ Active' if MISTRAL_API_KEY else '⚪ Disabled'}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🚀 <b>Quick Start:</b>\n"
-        "Simply <b>paste any URL directly into this chat</b>, or click <b>New Download</b> below."
+        "<b>⚡ Media Uploader</b>\n"
+        f"<blockquote><b>Status:</b> {status_badge}\n"
+        f"<b>Pipeline:</b> {mode_badge}  ·  <b>Channels:</b> {len(STORAGE_CHANNELS)}</blockquote>\n\n"
+        "Paste any media link in chat, or tap <b>New Download</b>."
     )
-    
-    buttons = [
-        [Button.inline("🚀 New Download", b"new_download")],
-    ]
-    
-    # Add Resume button if exists
-    if event.sender_id in LAST_TASK_INFO:
-        buttons.append([Button.inline("⏯ Resume Last Task", b"resume_last")])
-    
-    buttons.append([
-        Button.inline("📊 Storage Stats", b"stats_info"),
-        Button.inline("🧹 Clear Temp", b"clear_temp")
-    ])
-    buttons.append([Button.inline("❓ Help Guide", b"help")])
-    
-    # Safe storage channel buttons
+
+    buttons = []
+    if user_id in RUNNING_TASKS:
+        buttons.append([Button.inline("🛑 Cancel Active Task", b"cancel_task")])
+    else:
+        primary_row = [Button.inline("⬇️ New Download", b"new_download")]
+        if user_id in LAST_TASK_INFO:
+            primary_row.append(Button.inline("🔄 Resume Last", b"resume_last"))
+        buttons.append(primary_row)
+
+    secondary_row = [Button.inline("📊 Stats", b"stats_info")]
+    if len(STORAGE_CHANNELS) == 1:
+        ch_url = _telegram_channel_url(STORAGE_CHANNEL_ID)
+        if ch_url:
+            secondary_row.append(Button.url("📂 Storage", ch_url))
+    secondary_row.append(Button.inline("❓ Help", b"help"))
+    buttons.append(secondary_row)
+    return text, buttons
+
+
+async def _build_stats_view() -> tuple[str, list]:
+    active_count = len(RUNNING_TASKS)
+    temp_size_mb = _get_temp_cache_mb()
+    total_idx = await _get_supabase_media_count()
+    mode_label = "⚡ RAM Stream" if ENABLE_STREAM_UPLOAD else "💾 Disk Queue"
+    ch_display = ", ".join(str(c) for c in STORAGE_CHANNELS) if STORAGE_CHANNELS else "Not set"
+    ai_status = "⚡ Active" if MISTRAL_API_KEY else "⚪ Off"
+    sb_status = f"🟢 {total_idx} indexed" if supabase_client else "⚪ Off"
+
+    text = (
+        "<b>📊 System & Storage</b>\n"
+        f"<blockquote><b>Active Tasks:</b> <code>{active_count}</code>\n"
+        f"<b>Pipeline:</b> {mode_label}\n"
+        f"<b>Temp Cache:</b> <code>{temp_size_mb} MB</code>\n"
+        f"<b>Channels:</b> <code>{_esc(ch_display)}</code>\n"
+        f"<b>Mistral AI:</b> {ai_status}  ·  <b>Supabase:</b> {sb_status}</blockquote>"
+    )
+
+    buttons = [[
+        Button.inline("🔄 Refresh", b"stats_info"),
+        Button.inline("🧹 Clear Cache", b"clear_temp"),
+    ]]
+    ch_buttons = []
     for idx, cid in enumerate(STORAGE_CHANNELS):
-        if cid and str(cid).startswith("-100"):
-            clean_id = str(abs(cid))[3:]
-            label = f"📂 Storage Channel {idx+1}" if len(STORAGE_CHANNELS) > 1 else "📂 View Storage Channel"
-            buttons.append([Button.url(label, f"https://t.me/c/{clean_id}")])
-    
-    await event.respond(text, parse_mode='html', buttons=buttons)
+        ch_url = _telegram_channel_url(cid)
+        if ch_url:
+            label = f"📂 Channel {idx + 1}" if len(STORAGE_CHANNELS) > 1 else "📂 Open Storage"
+            ch_buttons.append(Button.url(label, ch_url))
+    for i in range(0, len(ch_buttons), 2):
+        buttons.append(ch_buttons[i:i + 2])
+    buttons.append([Button.inline("‹ Back", b"main_menu")])
+    return text, buttons
+
+
+def _build_help_view() -> tuple[str, list]:
+    text = (
+        "<b>❓ Quick Guide</b>\n\n"
+        "<blockquote><b>1.</b> Paste any video, album, or creator URL in chat.\n"
+        "<b>2.</b> Pick <b>Browse &amp; Select</b>, <b>Download All</b>, or a <b>Page Range</b>.\n"
+        "<b>3.</b> Choose a destination channel or forum topic.</blockquote>\n\n"
+        "<b>Commands</b>\n"
+        "• <code>/start</code> — Main menu\n"
+        "• <code>/download &lt;url&gt; [pages]</code> — Quick download\n"
+        "• <code>/crawl &lt;url&gt; [pages]</code> — Browse &amp; pick files\n"
+        "• <code>/topics</code> — Manage forum topics\n"
+        "• <code>/stats</code> — System &amp; cache status\n"
+        "• <code>/id</code> — Chat, topic &amp; user IDs\n"
+        "• <code>/cancel</code> — Cancel active task or prompt"
+    )
+    buttons = [[
+        Button.inline("⬇️ New Download", b"new_download"),
+        Button.inline("‹ Back", b"main_menu"),
+    ]]
+    return text, buttons
+
+
+async def prompt_url_options(event, user_id: int, url: str):
+    """Render unified options for a pasted or entered media URL."""
+    domain, service, cur_id, post_id = parse_media_url(url)
+    if not domain:
+        await _render_or_edit(
+            event,
+            "❌ <b>Unsupported URL</b>\nSend a valid link starting with <code>http://</code> or <code>https://</code>.",
+            buttons=[[Button.inline("‹ Back", b"main_menu")]],
+        )
+        return
+
+    service_label = _esc((service or "media").capitalize())
+    if post_id:
+        USER_STATES[user_id] = {
+            'url': url,
+            'range': None,
+            'dest': STORAGE_CHANNEL_ID,
+        }
+        dest_name = await get_chat_title_cached(STORAGE_CHANNEL_ID) if STORAGE_CHANNEL_ID else "Not configured"
+        text = (
+            "<b>🎬 Media Ready</b>\n"
+            f"<blockquote><b>Source:</b> {service_label}\n"
+            f"<b>Target:</b> <code>{_esc(_shorten_url(str(cur_id), 38))}</code>\n"
+            f"<b>Destination:</b> {_esc(dest_name)}</blockquote>"
+        )
+        if STORAGE_CHANNEL_ID:
+            buttons = [
+                [Button.inline("⚡ Download Now", b"quick_download_confirm")],
+                [
+                    Button.inline("📍 Destination", b"quick_choose_dest"),
+                    Button.inline("✕ Cancel", b"cancel_flow"),
+                ],
+            ]
+        else:
+            buttons = [[
+                Button.inline("📍 Choose Destination", b"quick_choose_dest"),
+                Button.inline("✕ Cancel", b"cancel_flow"),
+            ]]
+        await _render_or_edit(event, text, buttons=buttons)
+    else:
+        USER_STATES[user_id] = {'url': url, 'state': 'WAITING_RANGE'}
+        text = (
+            f"<b>📁 {service_label} Collection</b>\n"
+            f"<blockquote><code>{_esc(_shorten_url(url, 48))}</code></blockquote>\n\n"
+            "Choose how to fetch items:"
+        )
+        buttons = [
+            [
+                Button.inline("📋 Browse & Select", b"crawl_album"),
+                Button.inline("⬇️ Download All", b"range_all"),
+            ],
+            [
+                Button.inline("🔢 Page Range", b"range_custom"),
+                Button.inline("✕ Cancel", b"cancel_flow"),
+            ],
+        ]
+        await _render_or_edit(event, text, buttons=buttons)
+
+
+@client.on(events.NewMessage(pattern=r"^/start(?:@\S+)?$"))
+async def start_handler(event):
+    if not await check_admin_or_notify(event):
+        return
+    USER_STATES.pop(event.sender_id, None)
+    text, buttons = _build_main_menu(event.sender_id)
+    await _render_or_edit(event, text, buttons=buttons)
+
 
 async def show_topic_options(event, user_id, dest_id):
     USER_STATES[user_id]['dest'] = dest_id
+    USER_STATES[user_id]['state'] = 'WAITING_TOPIC'
+    chat_name = await get_chat_title_cached(dest_id)
     text = (
-        "🧵 <b>Forum Topic Selection</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📍 <b>Destination Group:</b> <code>{dest_id}</code>\n\n"
-        "Where should the files be uploaded?\n"
-        "• <b>➕ Create New Topic:</b> Start a new topic (bot creates it in group)\n"
-        "• <b>📑 Choose Existing Topic:</b> Pick from active topics in this group\n"
-        "• <b>💬 General Chat:</b> Upload without a specific topic"
+        "<b>🧵 Select Forum Topic</b>\n"
+        f"<blockquote><b>Group:</b> {_esc(chat_name)} (<code>{dest_id}</code>)</blockquote>\n\n"
+        "Where should uploads be posted?"
     )
     buttons = [
-        [Button.inline("➕ Create New Topic", b"topic_create")],
-        [Button.inline("📑 Choose Existing Topic", b"topic_existing_0")],
-        [Button.inline("💬 General / Main Chat", b"topic_general")],
-        [Button.inline("❌ Cancel", b"cancel_flow")]
+        [
+            Button.inline("➕ New Topic", b"topic_create"),
+            Button.inline("📑 Existing", b"topic_existing_0"),
+        ],
+        [Button.inline("💬 General Chat", b"topic_general")],
+        [
+            Button.inline("‹ Back", b"quick_choose_dest"),
+            Button.inline("✕ Cancel", b"cancel_flow"),
+        ],
     ]
-    try:
-        await event.edit(text, parse_mode='html', buttons=buttons)
-    except Exception:
-        await event.respond(text, parse_mode='html', buttons=buttons)
+    await _render_or_edit(event, text, buttons=buttons)
+
 
 async def handle_dest_selected(event, user_id, dest_id):
     USER_STATES[user_id]['dest'] = dest_id
@@ -1443,123 +1632,164 @@ async def handle_dest_selected(event, user_id, dest_id):
         USER_STATES[user_id]['topic_title'] = None
         await start_confirmed_download(event, user_id)
 
+
+async def _render_topics_list_view(dest_id: int) -> tuple[str, list]:
+    topics = await get_forum_topics_list(dest_id, limit=30)
+    chat_name = await get_chat_title_cached(dest_id)
+    if not topics:
+        text = (
+            "<b>📑 Forum Topics</b>\n"
+            f"<blockquote><b>Group:</b> {_esc(chat_name)} (<code>{dest_id}</code>)\n"
+            "No topics saved yet.</blockquote>\n\n"
+            "Create a new topic or register an existing topic ID."
+        )
+    else:
+        lines = [
+            f"<b>📑 Forum Topics</b>  ·  {_esc(chat_name)}",
+            f"<blockquote><b>Group ID:</b> <code>{dest_id}</code>  ·  <b>Count:</b> {len(topics)}</blockquote>",
+            "",
+        ]
+        for t in topics:
+            link = _telegram_channel_url(dest_id, t['id'])
+            badge = "🔒" if t.get('closed') else "🟢"
+            title_html = _esc(t['title'])
+            if link:
+                lines.append(f"{badge} <a href=\"{link}\"><b>{title_html}</b></a> · <code>{t['id']}</code>")
+            else:
+                lines.append(f"{badge} <b>{title_html}</b> · <code>{t['id']}</code>")
+        text = "\n".join(lines)
+
+    buttons = [
+        [
+            Button.inline("➕ New Topic", f"topics_new:{dest_id}".encode()),
+            Button.inline("📌 Add ID", f"topics_add:{dest_id}".encode()),
+        ],
+        [
+            Button.inline("🔄 Refresh", f"topics_refresh:{dest_id}".encode()),
+            Button.inline("🏠 Menu", b"main_menu"),
+        ],
+    ]
+    return text, buttons
+
+
 @client.on(events.CallbackQuery())
 async def callback_handler(event):
     if not is_admin(event.sender_id):
         await event.answer("⛔ Unauthorized.", alert=True)
         return
-    
+
     data = event.data.decode()
     user_id = event.sender_id
-    
+
     if data == "new_download":
         if user_id in RUNNING_TASKS:
-            await event.answer("⚠️ A task is already running! Cancel it first.", alert=True)
+            await event.answer("⚠️ A task is already running. Cancel it first.", alert=True)
             return
 
         USER_STATES[user_id] = {'state': 'WAITING_URL'}
-        await event.respond(
-            "🔗 <b>Step 1: From Where?</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send the XMoviesForYou, UXSeries, HDMaal, Viralchut, Coomer, or Bunkr URL you want to scrape.\n\n"
-            "💡 <i>Examples:</i>\n"
-            "• <code>https://xmoviesforyou.com/page/7</code>\n"
-            "• <code>https://xmoviesforyou.com/devilsfilm-serena-sterling-deepthroat-diagnosis</code>\n"
-            "• <code>https://uxseries.co/actress/bharti-jha/</code>\n"
-            "• <code>https://hdmaal.movie/model/bharti-jha/</code>\n"
-            "• <code>https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
-            "• <code>https://uxseries.co/series/shatir/</code>\n"
-            "• <code>https://viralchut.com/video-slug/</code>\n"
-            "• <code>https://bunkr.cr/a/album_id</code>\n"
-            "• <code>https://coomer.st/onlyfans/user/example</code>", 
-            parse_mode='html',
-            buttons=[Button.inline("❌ Cancel", b"cancel_flow")]
+        await _render_or_edit(
+            event,
+            "<b>⬇️ New Download</b>\n\n"
+            "Send any video, album, or creator URL.\n"
+            "<blockquote>Supports web pages, galleries, series, and direct <code>.mp4</code>/<code>.m3u8</code> links.</blockquote>",
+            buttons=[[Button.inline("‹ Back", b"main_menu")]],
         )
         await event.answer()
-        
+
     elif data == "cancel_flow":
         USER_STATES.pop(user_id, None)
-        await event.edit("❌ <b>Process Cancelled.</b>", parse_mode='html')
+        await _render_or_edit(
+            event,
+            "<b>✕ Cancelled</b>",
+            buttons=[[
+                Button.inline("⬇️ New Download", b"new_download"),
+                Button.inline("🏠 Menu", b"main_menu"),
+            ]],
+        )
         await event.answer("Cancelled", alert=False)
-        
+
     elif data == "clear_temp":
         if RUNNING_TASKS:
             await event.answer("⚠️ Active tasks are running. Cancel them first.", alert=True)
             return
+        cleared = False
         if os.path.exists(DOWNLOAD_DIR):
             shutil.rmtree(DOWNLOAD_DIR)
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-            await event.answer("🧹 Temporary files cleared!", alert=True)
-        else:
-            await event.answer("Temp folder is already empty.")
+            cleared = True
+        text, buttons = await _build_stats_view()
+        await _render_or_edit(event, text, buttons=buttons)
+        await event.answer("🧹 Temp cache cleared!" if cleared else "Cache is already empty.", alert=False)
 
     elif data == "stats_info":
-        total_idx = await _get_supabase_media_count()
-        stat_text = (
-            "📊 <b>Uploader & Storage Overview</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Active Upload Tasks:</b> <code>{len(RUNNING_TASKS)}</code>\n"
-            f"• <b>Storage Channel ID:</b> <code>{STORAGE_CHANNEL_ID}</code>\n"
-            f"• <b>Indexed Supabase Videos:</b> <code>{total_idx}</code>\n"
-            f"• <b>Temp Download Dir:</b> <code>{DOWNLOAD_DIR}</code>\n"
-            f"• <b>Upload Pipeline:</b> Sequential MTProto Queue\n"
-            f"• <b>Mistral AI:</b> {'⚡ Active' if MISTRAL_API_KEY else '⚪ Disabled'}\n"
-            f"• <b>Service Health:</b> 🟢 100% Operational\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━"
-        )
-        await event.respond(stat_text, parse_mode='html', buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]])
+        text, buttons = await _build_stats_view()
+        await _render_or_edit(event, text, buttons=buttons)
         await event.answer()
 
     elif data == "main_menu":
         USER_STATES.pop(user_id, None)
-        await start_handler(event)
+        text, buttons = _build_main_menu(user_id)
+        await _render_or_edit(event, text, buttons=buttons)
         await event.answer()
-            
+
     elif data == "help":
-        help_text = (
-            "📖 <b>Premium Help Guide</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>Commands:</b>\n"
-            "• /start - 🚀 Open main menu\n"
-            "• /download [url] - 📥 Quick download\n"
-            "• /viralchut [url] - 🔥 Quick Viralchut scraper\n"
-            "• /bunkr [url] - ⚡ Quick Bunkr scraper\n"
-            "• /help - ❓ Show this guide\n\n"
-            "<b>Interactive Flow:</b>\n"
-            "1. Click 'New Download' or paste link\n"
-            "2. Select 'Browse & Select Files' to pick items\n"
-            "3. Choose destination channel\n"
-            "4. Monitor real-time upload progress bars!"
-        )
-        await event.respond(help_text, parse_mode='html')
+        text, buttons = _build_help_view()
+        await _render_or_edit(event, text, buttons=buttons)
         await event.answer()
 
     elif data == "cancel_task":
         if user_id in RUNNING_TASKS:
             RUNNING_TASKS[user_id].cancel()
-            await event.answer("🛑 Cancelling task...", alert=False)
+            await event.answer("🛑 Cancelling task…", alert=False)
         else:
             await event.answer("ℹ️ No active task to cancel.")
 
     elif data == "resume_last":
         if user_id in RUNNING_TASKS:
-            await event.answer("⚠️ A task is already running! Cancel it first.", alert=True)
+            await event.answer("⚠️ A task is already running. Cancel it first.", alert=True)
             return
-        
+
         info = LAST_TASK_INFO.get(user_id)
         if info:
-            await event.answer("⏯ Resuming last task...")
-            await event.respond(f"⏯ <b>Resuming Last Task...</b>\n🔗 Source: {info['url']}", parse_mode='html')
+            await event.answer("🔄 Resuming last task…")
+            msg = await _render_or_edit(
+                event,
+                f"<b>🔄 Resuming Task</b>\n<blockquote><code>{_esc(_shorten_url(info['url'], 48))}</code></blockquote>",
+                buttons=[[Button.inline("🛑 Cancel Task", b"cancel_task")]],
+            )
             asyncio.create_task(download_and_upload(
                 event,
                 info['url'],
                 info['range'],
                 info['dest'],
                 selected_videos=info.get('selected_videos'),
-                topic_id=info.get('topic_id')
+                topic_id=info.get('topic_id'),
+                status_msg=msg,
             ))
         else:
-            await event.answer("❌ No previous task found.")
+            await event.answer("❌ No previous task found.", alert=True)
+
+    elif data == "back_to_mode":
+        if user_id not in USER_STATES or 'url' not in USER_STATES[user_id]:
+            await event.answer("ℹ️ Session expired. Send the link again.", alert=True)
+            return
+        url = USER_STATES[user_id]['url']
+        await prompt_url_options(event, user_id, url)
+        await event.answer()
+
+    elif data == "back_from_dest":
+        if user_id not in USER_STATES or 'url' not in USER_STATES[user_id]:
+            await event.answer("ℹ️ Session expired. Send the link again.", alert=True)
+            return
+        state = USER_STATES[user_id]
+        if 'videos' in state:
+            state.pop('selected_videos', None)
+            state['state'] = 'BROWSING'
+            text, buttons = render_album_browser(user_id)
+            await _render_or_edit(event, text, buttons=buttons)
+        else:
+            await prompt_url_options(event, user_id, state['url'])
+        await event.answer()
 
     elif data == "sel_all_items":
         if user_id not in USER_STATES or 'videos' not in USER_STATES[user_id]:
@@ -1568,9 +1798,8 @@ async def callback_handler(event):
         videos = USER_STATES[user_id]['videos']
         USER_STATES[user_id]['selected'] = set(range(len(videos)))
         text, buttons = render_album_browser(user_id)
-        await event.edit(text, parse_mode='html', buttons=buttons)
-        await event.answer(f"✅ Selected all {len(videos)} files!", alert=False)
-
+        await _render_or_edit(event, text, buttons=buttons)
+        await event.answer(f"Selected all {len(videos)} items", alert=False)
 
     elif data == "crawl_album":
         if user_id not in USER_STATES:
@@ -1578,22 +1807,34 @@ async def callback_handler(event):
             return
 
         if user_id in RUNNING_TASKS:
-            await event.answer("⚠️ A task is already running! Cancel it first.", alert=True)
+            await event.answer("⚠️ A task is already running. Cancel it first.", alert=True)
             return
 
         url = USER_STATES[user_id].get('url', '')
-        await event.edit("⏳ <b>Crawling Album Files...</b>\nScanning source and extracting file list, please wait...", parse_mode='html')
-        
+        await _render_or_edit(
+            event,
+            f"<b>⏳ Scanning Source</b>\n<blockquote><code>{_esc(_shorten_url(url, 48))}</code></blockquote>",
+            buttons=[[Button.inline("✕ Cancel", b"cancel_flow")]],
+        )
+
         try:
             domain, service, cur_id, post_id = parse_media_url(url)
             posts = await fetch_all_posts(domain, service, cur_id, page_range=None, post_id=post_id)
             if not posts:
-                await event.edit("❌ <b>No posts or items found in this album.</b>", parse_mode='html', buttons=[[Button.inline("❌ Close", b"cancel_flow")]])
+                await _render_or_edit(
+                    event,
+                    "❌ <b>No items found at this URL.</b>",
+                    buttons=[[Button.inline("‹ Back", b"back_to_mode"), Button.inline("✕ Cancel", b"cancel_flow")]],
+                )
                 return
 
             videos = extract_video_urls(domain, posts)
             if not videos:
-                await event.edit("⚠️ <b>No downloadable videos found in this album.</b>", parse_mode='html', buttons=[[Button.inline("❌ Close", b"cancel_flow")]])
+                await _render_or_edit(
+                    event,
+                    "⚠️ <b>No downloadable videos found.</b>",
+                    buttons=[[Button.inline("‹ Back", b"back_to_mode"), Button.inline("✕ Cancel", b"cancel_flow")]],
+                )
                 return
 
             USER_STATES[user_id]['videos'] = videos
@@ -1601,51 +1842,71 @@ async def callback_handler(event):
             USER_STATES[user_id]['browser_page'] = 0
 
             text, buttons = render_album_browser(user_id)
-            await event.edit(text, parse_mode='html', buttons=buttons)
+            await _render_or_edit(event, text, buttons=buttons)
             await event.answer()
         except Exception as e:
             logger.error(f"Error crawling album: {e}")
-            await event.edit(f"❌ <b>Error crawling album:</b> {e}", parse_mode='html', buttons=[[Button.inline("❌ Close", b"cancel_flow")]])
+            await _render_or_edit(
+                event,
+                f"❌ <b>Scan Error</b>\n<blockquote><code>{_esc(e)}</code></blockquote>",
+                buttons=[[Button.inline("‹ Back", b"back_to_mode"), Button.inline("✕ Cancel", b"cancel_flow")]],
+            )
 
     elif data.startswith("sel_tog:"):
         if user_id not in USER_STATES or 'videos' not in USER_STATES[user_id]:
             await event.answer("ℹ️ Session expired. Please resend the link.", alert=True)
             return
-        idx = int(data.split(":")[1])
+        try:
+            idx = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer("Invalid item.", alert=True)
+            return
+        videos = USER_STATES[user_id]['videos']
+        if idx < 0 or idx >= len(videos):
+            await event.answer("Item out of range.", alert=True)
+            return
         selected = USER_STATES[user_id].setdefault('selected', set())
         if idx in selected:
             selected.remove(idx)
         else:
             selected.add(idx)
         text, buttons = render_album_browser(user_id)
-        await event.edit(text, parse_mode='html', buttons=buttons)
+        await _render_or_edit(event, text, buttons=buttons)
         await event.answer()
 
     elif data.startswith("sel_pg:"):
         if user_id not in USER_STATES or 'videos' not in USER_STATES[user_id]:
             await event.answer("ℹ️ Session expired.", alert=True)
             return
-        pg = int(data.split(":")[1])
+        try:
+            pg = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer()
+            return
         USER_STATES[user_id]['browser_page'] = pg
         text, buttons = render_album_browser(user_id)
-        await event.edit(text, parse_mode='html', buttons=buttons)
+        await _render_or_edit(event, text, buttons=buttons)
         await event.answer()
 
     elif data.startswith("sel_all_pg:"):
         if user_id not in USER_STATES or 'videos' not in USER_STATES[user_id]:
             await event.answer("ℹ️ Session expired.", alert=True)
             return
-        pg = int(data.split(":")[1])
+        try:
+            pg = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer()
+            return
         page_size = 5
         videos = USER_STATES[user_id]['videos']
         selected = USER_STATES[user_id].setdefault('selected', set())
-        start = pg * page_size
+        start = max(0, pg) * page_size
         end = min(len(videos), start + page_size)
         for i in range(start, end):
             selected.add(i)
         text, buttons = render_album_browser(user_id)
-        await event.edit(text, parse_mode='html', buttons=buttons)
-        await event.answer(f"Selected {end - start} items.")
+        await _render_or_edit(event, text, buttons=buttons)
+        await event.answer(f"Selected {max(0, end - start)} items")
 
     elif data == "sel_clear":
         if user_id not in USER_STATES or 'videos' not in USER_STATES[user_id]:
@@ -1653,8 +1914,8 @@ async def callback_handler(event):
             return
         USER_STATES[user_id]['selected'] = set()
         text, buttons = render_album_browser(user_id)
-        await event.edit(text, parse_mode='html', buttons=buttons)
-        await event.answer("Selection cleared.")
+        await _render_or_edit(event, text, buttons=buttons)
+        await event.answer("Selection cleared")
 
     elif data == "sel_confirm":
         if user_id not in USER_STATES or 'videos' not in USER_STATES[user_id]:
@@ -1662,10 +1923,10 @@ async def callback_handler(event):
             return
         selected = USER_STATES[user_id].get('selected', set())
         if not selected:
-            await event.answer("⚠️ Please select at least one file first.", alert=True)
+            await event.answer("⚠️ Select at least one file first.", alert=True)
             return
         videos = USER_STATES[user_id]['videos']
-        chosen = [videos[i] for i in sorted(selected)]
+        chosen = [videos[i] for i in sorted(selected) if 0 <= i < len(videos)]
         USER_STATES[user_id]['selected_videos'] = chosen
         USER_STATES[user_id]['range'] = None
         await ask_destination(event, user_id)
@@ -1686,27 +1947,33 @@ async def callback_handler(event):
     elif data == "quick_download_confirm":
         if user_id in USER_STATES:
             await handle_dest_selected(event, user_id, STORAGE_CHANNEL_ID)
+            await event.answer()
         else:
-            await event.answer("Session expired, please paste the link again.", alert=True)
+            await event.answer("Session expired. Paste the link again.", alert=True)
 
     elif data == "quick_choose_dest":
         if user_id in USER_STATES:
             await ask_destination(event, user_id)
             await event.answer()
         else:
-            await event.answer("Session expired, please paste the link again.", alert=True)
+            await event.answer("Session expired. Paste the link again.", alert=True)
 
     elif data == "quick_dest_topic":
         if user_id in USER_STATES:
             await show_topic_options(event, user_id, STORAGE_CHANNEL_ID)
+            await event.answer()
         else:
-            await event.answer("Session expired, please paste the link again.", alert=True)
+            await event.answer("Session expired. Paste the link again.", alert=True)
 
     elif data.startswith("dest_pick:"):
         if user_id not in USER_STATES:
             await event.answer("Session expired.", alert=True)
             return
-        cid = int(data.split(":")[1])
+        try:
+            cid = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer("Invalid channel.", alert=True)
+            return
         await handle_dest_selected(event, user_id, cid)
         await event.answer()
 
@@ -1714,7 +1981,11 @@ async def callback_handler(event):
         if user_id not in USER_STATES:
             await event.answer("Session expired.", alert=True)
             return
-        cid = int(data.split(":")[1])
+        try:
+            cid = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer("Invalid channel.", alert=True)
+            return
         await show_topic_options(event, user_id, cid)
         await event.answer()
 
@@ -1727,12 +1998,16 @@ async def callback_handler(event):
             USER_STATES[user_id]['range'] = None
             await ask_destination(event, user_id)
             await event.answer()
-            
+
         elif data == "range_custom":
             USER_STATES[user_id]['state'] = 'WAITING_RANGE_INPUT'
-            await event.respond("🔢 Please send the page range (e.g., <code>1-3</code> or <code>1</code>).", parse_mode='html', buttons=[Button.inline("❌ Cancel", b"cancel_flow")])
+            await _render_or_edit(
+                event,
+                "<b>🔢 Page Range</b>\n\nSend a page number or range, e.g. <code>1-3</code> or <code>2</code>.",
+                buttons=[[Button.inline("‹ Back", b"back_to_mode"), Button.inline("✕ Cancel", b"cancel_flow")]],
+            )
             await event.answer()
-            
+
         elif data == "dest_default":
             await handle_dest_selected(event, user_id, STORAGE_CHANNEL_ID)
             await event.answer()
@@ -1740,94 +2015,96 @@ async def callback_handler(event):
         elif data == "dest_default_topic":
             await show_topic_options(event, user_id, STORAGE_CHANNEL_ID)
             await event.answer()
-            
+
         elif data == "dest_custom":
             USER_STATES[user_id]['state'] = 'WAITING_DEST_INPUT'
-            await event.respond("🆔 Please send the numeric Channel ID (e.g., <code>-100123456789</code>).", parse_mode='html', buttons=[Button.inline("❌ Cancel", b"cancel_flow")])
+            await _render_or_edit(
+                event,
+                "<b>🆔 Custom Destination</b>\n\n"
+                "Send the numeric Channel or Group ID (e.g. <code>-1001234567890</code>).\n"
+                "<i>Tip: Run <code>/id</code> inside any chat to get its ID.</i>",
+                buttons=[[Button.inline("‹ Back", b"quick_choose_dest"), Button.inline("✕ Cancel", b"cancel_flow")]],
+            )
             await event.answer()
 
     elif data == "topic_create":
         if user_id not in USER_STATES:
             await event.answer("Session expired. Please start again.", alert=True)
             return
+        dest_id = USER_STATES[user_id].get('dest', STORAGE_CHANNEL_ID)
         USER_STATES[user_id]['state'] = 'WAITING_TOPIC_TITLE'
-        prompt_text = (
-            "✏️ <b>Enter New Topic Title:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Please send the title/name for the new forum topic in your group.\n\n"
-            "💡 <i>Example:</i> <code>Serena Sterling Collection</code> or <code>Bunkr - Vacation</code>\n"
-            "The bot will create the topic in your group and upload into it."
+        await _render_or_edit(
+            event,
+            "<b>➕ New Forum Topic</b>\n\nSend the title for the new topic.",
+            buttons=[[Button.inline("‹ Back", f"dest_topic_pick:{dest_id}".encode()), Button.inline("✕ Cancel", b"cancel_flow")]],
         )
-        await event.respond(prompt_text, parse_mode='html', buttons=[[Button.inline("❌ Cancel", b"cancel_flow")]])
         await event.answer()
 
     elif data.startswith("topic_existing"):
         if user_id not in USER_STATES:
             await event.answer("Session expired. Please start again.", alert=True)
             return
+        USER_STATES[user_id]['state'] = 'WAITING_TOPIC'
         dest_id = USER_STATES[user_id].get('dest', STORAGE_CHANNEL_ID)
         page_num = 0
         try:
             parts = data.split("_")
             if len(parts) >= 3:
-                page_num = int(parts[2])
+                page_num = max(0, int(parts[2]))
         except Exception:
             page_num = 0
 
         topics = await get_forum_topics_list(dest_id, limit=50)
         if not topics:
-            await event.edit(
-                "⚠️ <b>No Topics Found in this Group</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"No saved topics yet for group <code>{dest_id}</code>.\n\n"
-                "• Tap <b>➕ Create New Topic</b> to have the bot create one.\n"
-                "• Tap <b>🔢 Enter Topic ID</b> to enter an existing topic ID.\n"
-                "• Or run <code>/addtopic &lt;id&gt; &lt;name&gt;</code>.",
-                parse_mode='html',
+            await _render_or_edit(
+                event,
+                "<b>⚠️ No Saved Topics</b>\n"
+                f"<blockquote>Group: <code>{dest_id}</code></blockquote>\n\n"
+                "Create a new topic or enter an existing topic ID.",
                 buttons=[
-                    [Button.inline("➕ Create New Topic", b"topic_create")],
-                    [Button.inline("🔢 Enter Topic ID Manually", b"topic_manual")],
-                    [Button.inline("💬 General / Main Chat", b"topic_general")],
-                    [Button.inline("🔙 Back", f"dest_topic_pick:{dest_id}".encode())]
-                ]
+                    [Button.inline("➕ New Topic", b"topic_create"), Button.inline("🔢 Topic ID", b"topic_manual")],
+                    [Button.inline("💬 General Chat", b"topic_general")],
+                    [Button.inline("‹ Back", f"dest_topic_pick:{dest_id}".encode()), Button.inline("✕ Cancel", b"cancel_flow")],
+                ],
             )
             await event.answer()
             return
 
-        page_size = 5
+        page_size = 6
+        total_pages = max(1, (len(topics) + page_size - 1) // page_size)
+        page_num = min(page_num, total_pages - 1)
         start_idx = page_num * page_size
         end_idx = min(len(topics), start_idx + page_size)
         cur_topics = topics[start_idx:end_idx]
 
         buttons = []
         for t in cur_topics:
-            title_disp = (t['title'][:22] + "...") if len(t['title']) > 22 else t['title']
-            cb = f"top_pick:{t['id']}:{t['title'][:16]}".encode()
-            buttons.append([Button.inline(f"📑 {title_disp}", cb)])
+            title_disp = (t['title'][:26] + "…") if len(t['title']) > 26 else t['title']
+            buttons.append([Button.inline(f"📑 {title_disp}", f"top_pick:{t['id']}".encode())])
 
-        nav_row = []
-        if page_num > 0:
-            nav_row.append(Button.inline("⬅️ Prev", f"topic_existing_{page_num - 1}".encode()))
-        if end_idx < len(topics):
-            nav_row.append(Button.inline("Next ➡️", f"topic_existing_{page_num + 1}".encode()))
-        if nav_row:
+        if total_pages > 1:
+            nav_row = []
+            if page_num > 0:
+                nav_row.append(Button.inline("◀️ Prev", f"topic_existing_{page_num - 1}".encode()))
+            nav_row.append(Button.inline(f"📄 {page_num + 1}/{total_pages}", b"noop"))
+            if page_num < total_pages - 1:
+                nav_row.append(Button.inline("Next ▶️", f"topic_existing_{page_num + 1}".encode()))
             buttons.append(nav_row)
 
         buttons.append([
-            Button.inline("➕ Create New", b"topic_create"),
-            Button.inline("🔢 Manual ID", b"topic_manual")
+            Button.inline("➕ New Topic", b"topic_create"),
+            Button.inline("🔢 Topic ID", b"topic_manual"),
         ])
         buttons.append([
             Button.inline("💬 General", b"topic_general"),
-            Button.inline("❌ Cancel", b"cancel_flow")
+            Button.inline("‹ Back", f"dest_topic_pick:{dest_id}".encode()),
         ])
 
         text = (
-            f"📑 <b>Select Topic ({start_idx + 1}-{end_idx} of {len(topics)}):</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Click a topic to upload into it:"
+            f"<b>📑 Select Topic</b>  ·  Page {page_num + 1}/{total_pages}\n"
+            f"<blockquote>Showing {start_idx + 1}–{end_idx} of {len(topics)}</blockquote>"
         )
-        await event.edit(text, parse_mode='html', buttons=buttons)
+        await _render_or_edit(event, text, buttons=buttons)
         await event.answer()
 
     elif data.startswith("top_pick:"):
@@ -1835,13 +2112,16 @@ async def callback_handler(event):
             await event.answer("Session expired. Please start again.", alert=True)
             return
         parts = data.split(":", 2)
-        topic_id = int(parts[1])
+        try:
+            topic_id = int(parts[1])
+        except (IndexError, ValueError):
+            await event.answer("Invalid topic.", alert=True)
+            return
         dest_id = USER_STATES[user_id].get('dest', STORAGE_CHANNEL_ID)
         stored_title = load_forum_topics().get(str(dest_id), {}).get(str(topic_id), {}).get('title')
-        topic_title = stored_title or (parts[2] if len(parts) > 2 else f"ID {topic_id}")
+        topic_title = stored_title or (parts[2] if len(parts) > 2 else f"Topic #{topic_id}")
         USER_STATES[user_id]['topic_id'] = topic_id
         USER_STATES[user_id]['topic_title'] = topic_title
-        await event.edit(f"✅ Selected Topic: <b>{topic_title}</b> (ID: <code>{topic_id}</code>).\nStarting upload...", parse_mode='html')
         await start_confirmed_download(event, user_id)
         await event.answer()
 
@@ -1849,14 +2129,13 @@ async def callback_handler(event):
         if user_id not in USER_STATES:
             await event.answer("Session expired. Please start again.", alert=True)
             return
+        dest_id = USER_STATES[user_id].get('dest', STORAGE_CHANNEL_ID)
         USER_STATES[user_id]['state'] = 'WAITING_TOPIC_ID'
-        await event.respond(
-            "🔢 <b>Enter Numeric Topic ID:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Send the numeric Topic ID (Thread ID) to upload into (e.g. <code>2</code> or <code>12345</code>).\n\n"
-            "💡 <i>Tip: Copy link to any message inside that topic. The number after the group ID is the topic ID.</i>",
-            parse_mode='html',
-            buttons=[[Button.inline("❌ Cancel", b"cancel_flow")]]
+        await _render_or_edit(
+            event,
+            "<b>🔢 Enter Topic ID</b>\n\n"
+            "Send the numeric Topic ID (e.g. <code>8</code> or <code>8 My Topic</code>).",
+            buttons=[[Button.inline("‹ Back", f"dest_topic_pick:{dest_id}".encode()), Button.inline("✕ Cancel", b"cancel_flow")]],
         )
         await event.answer()
 
@@ -1865,92 +2144,150 @@ async def callback_handler(event):
             await event.answer("Session expired. Please start again.", alert=True)
             return
         USER_STATES[user_id]['topic_id'] = None
-        USER_STATES[user_id]['topic_title'] = "General / Main"
-        await event.edit("💬 Selected <b>General / Main Chat</b>. Starting...", parse_mode='html')
+        USER_STATES[user_id]['topic_title'] = "General Chat"
         await start_confirmed_download(event, user_id)
         await event.answer()
 
+    elif data.startswith("topics_refresh:"):
+        try:
+            dest_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer("Invalid group ID.", alert=True)
+            return
+        if USER_STATES.get(user_id, {}).get('standalone'):
+            USER_STATES.pop(user_id, None)
+        text, buttons = await _render_topics_list_view(dest_id)
+        await _render_or_edit(event, text, buttons=buttons)
+        await event.answer("Refreshed")
+
+    elif data.startswith("topics_new:"):
+        try:
+            dest_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer("Invalid group ID.", alert=True)
+            return
+        USER_STATES[user_id] = {'state': 'WAITING_TOPIC_TITLE', 'dest': dest_id, 'standalone': True}
+        await _render_or_edit(
+            event,
+            "<b>➕ New Forum Topic</b>\n\nSend the title for the new topic.",
+            buttons=[[Button.inline("‹ Back", f"topics_refresh:{dest_id}".encode()), Button.inline("✕ Cancel", b"cancel_flow")]],
+        )
+        await event.answer()
+
+    elif data.startswith("topics_add:"):
+        try:
+            dest_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await event.answer("Invalid group ID.", alert=True)
+            return
+        USER_STATES[user_id] = {'state': 'WAITING_TOPIC_ID', 'dest': dest_id, 'standalone': True}
+        await _render_or_edit(
+            event,
+            "<b>📌 Register Existing Topic</b>\n\nSend <code>&lt;topic_id&gt; [title]</code> (e.g. <code>8 My Topic</code>).",
+            buttons=[[Button.inline("‹ Back", f"topics_refresh:{dest_id}".encode()), Button.inline("✕ Cancel", b"cancel_flow")]],
+        )
+        await event.answer()
+
+
 @client.on(events.NewMessage())
 async def message_handler(event):
-    text = event.text.strip()
-    if text.startswith('/'): return # Ignore commands here
-    if not await check_admin_or_notify(event): return
+    text = (event.text or "").strip()
+    if not text or text.startswith('/'):
+        return
 
     user_id = event.sender_id
-    
+    is_url = text.startswith('http://') or text.startswith('https://')
+    if getattr(event, "is_group", False) and user_id not in USER_STATES and not is_url:
+        return
+
+    if not await check_admin_or_notify(event):
+        return
+
     if user_id in USER_STATES:
         state = USER_STATES[user_id].get('state')
-        
+
         if state == 'WAITING_URL':
-            if text.startswith('http'):
-                USER_STATES[user_id]['url'] = text
-                domain, service, cur_id, post_id = parse_media_url(text)
-                if post_id:
-                    # Single item detected, skip range prompt
-                    USER_STATES[user_id]['range'] = None
-                    await ask_destination(event, user_id)
-                else:
-                    USER_STATES[user_id]['state'] = 'WAITING_RANGE'
-                    await event.respond(
-                        "📑 <b>Step 2: Choose Download Mode</b>\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "Do you want to browse and pick files, download all, or specify a page range?", 
-                        parse_mode='html', 
-                        buttons=[
-                            [Button.inline("📋 Browse & Select Files", b"crawl_album")],
-                            [Button.inline("📄 All Pages / Videos", b"range_all")],
-                            [Button.inline("🔢 Custom Range", b"range_custom")],
-                            [Button.inline("❌ Cancel", b"cancel_flow")]
-                        ]
-                    )
+            if is_url:
+                await prompt_url_options(event, user_id, text)
             else:
-                await event.respond("❌ <b>Invalid URL.</b>\nPlease send a valid link starting with <code>http</code>.", parse_mode='html')
-                
+                await event.respond(
+                    "❌ <b>Invalid URL</b>\nSend a link starting with <code>http://</code> or <code>https://</code>.",
+                    parse_mode='html',
+                    buttons=[[Button.inline("✕ Cancel", b"cancel_flow")]],
+                    link_preview=False,
+                )
+
         elif state == 'WAITING_RANGE_INPUT':
+            if not parse_page_range(text):
+                await event.respond(
+                    "❌ <b>Invalid Range</b>\nSend a page or range like <code>2</code> or <code>1-3</code>.",
+                    parse_mode='html',
+                    buttons=[[Button.inline("‹ Back", b"back_to_mode"), Button.inline("✕ Cancel", b"cancel_flow")]],
+                )
+                return
             USER_STATES[user_id]['range'] = text
             await ask_destination(event, user_id)
-            
+
         elif state == 'WAITING_DEST_INPUT':
             try:
                 channel_id = int(text)
                 await handle_dest_selected(event, user_id, channel_id)
             except ValueError:
-                await event.respond("❌ <b>Invalid ID.</b>\nPlease send a numeric Channel ID.", parse_mode='html')
+                await event.respond(
+                    "❌ <b>Invalid ID</b>\nSend a numeric Channel or Group ID (e.g. <code>-1001234567890</code>).",
+                    parse_mode='html',
+                    buttons=[[Button.inline("‹ Back", b"quick_choose_dest"), Button.inline("✕ Cancel", b"cancel_flow")]],
+                )
 
         elif state == 'WAITING_TOPIC_TITLE':
             topic_title = text.strip()
             dest_id = USER_STATES[user_id].get('dest', STORAGE_CHANNEL_ID)
-            status_m = await event.respond(f"⏳ Creating topic <b>{topic_title}</b> in group...", parse_mode='html')
+            is_standalone = USER_STATES[user_id].get('standalone') or 'url' not in USER_STATES[user_id]
+            status_m = await event.respond(
+                f"⏳ Creating topic <b>{_esc(topic_title)}</b>…",
+                parse_mode='html',
+                link_preview=False,
+            )
             try:
                 topic_id = await create_forum_topic_helper(dest_id, topic_title)
                 if topic_id:
-                    await status_m.edit(f"✅ Created topic <b>{topic_title}</b> (ID: <code>{topic_id}</code>)!")
-                    USER_STATES[user_id]['topic_id'] = topic_id
-                    USER_STATES[user_id]['topic_title'] = topic_title
-                    await start_confirmed_download(event, user_id)
+                    if is_standalone:
+                        USER_STATES.pop(user_id, None)
+                        topic_link = _telegram_channel_url(dest_id, topic_id)
+                        link_line = f"\n<b>Link:</b> <a href=\"{topic_link}\">Open Topic</a>" if topic_link else ""
+                        await status_m.edit(
+                            "<b>✅ Topic Created</b>\n"
+                            f"<blockquote><b>Title:</b> {_esc(topic_title)}\n"
+                            f"<b>ID:</b> <code>{topic_id}</code>{link_line}</blockquote>",
+                            parse_mode='html',
+                            buttons=[[
+                                Button.inline("📑 Topics", f"topics_refresh:{dest_id}".encode()),
+                                Button.inline("🏠 Menu", b"main_menu"),
+                            ]],
+                            link_preview=False,
+                        )
+                    else:
+                        USER_STATES[user_id]['topic_id'] = topic_id
+                        USER_STATES[user_id]['topic_title'] = topic_title
+                        await start_confirmed_download(event, user_id, status_msg=status_m)
                 else:
                     await status_m.edit(
-                        "⚠️ Failed to obtain topic ID.\n"
-                        "Please verify bot has 'Manage Topics' admin permission in the group.",
+                        "⚠️ <b>Could not obtain Topic ID.</b>\nCheck that the bot has 'Manage Topics' permission.",
+                        parse_mode='html',
                         buttons=[
-                            [Button.inline("➕ Try Again", b"topic_create")],
-                            [Button.inline("📑 Choose Existing Topic", b"topic_existing_0")],
-                            [Button.inline("💬 General / Main Chat", b"topic_general")],
-                            [Button.inline("❌ Cancel", b"cancel_flow")]
-                        ]
+                            [Button.inline("➕ Try Again", b"topic_create"), Button.inline("📑 Existing", b"topic_existing_0")],
+                            [Button.inline("💬 General Chat", b"topic_general"), Button.inline("✕ Cancel", b"cancel_flow")],
+                        ],
                     )
             except Exception as e:
                 logger.error(f"Error creating topic: {e}")
                 await status_m.edit(
-                    f"❌ <b>Error creating topic:</b> <code>{e}</code>\n\n"
-                    "<i>Make sure the bot has Admin rights with 'Manage Topics' enabled in the group.</i>",
+                    f"❌ <b>Topic Creation Failed</b>\n<blockquote><code>{_esc(e)}</code></blockquote>",
                     parse_mode='html',
                     buttons=[
-                        [Button.inline("➕ Try Again", b"topic_create")],
-                        [Button.inline("📑 Choose Existing Topic", b"topic_existing_0")],
-                        [Button.inline("💬 General / Main Chat", b"topic_general")],
-                        [Button.inline("❌ Cancel", b"cancel_flow")]
-                    ]
+                        [Button.inline("➕ Try Again", b"topic_create"), Button.inline("📑 Existing", b"topic_existing_0")],
+                        [Button.inline("💬 General Chat", b"topic_general"), Button.inline("✕ Cancel", b"cancel_flow")],
+                    ],
                 )
 
         elif state == 'WAITING_TOPIC_ID':
@@ -1962,527 +2299,380 @@ async def message_handler(event):
                     topic_title = raw_parts[1].strip()
                 else:
                     stored = load_forum_topics().get(str(dest_id), {}).get(str(topic_id))
-                    if stored and stored.get('title'):
-                        topic_title = stored['title']
-                    else:
-                        topic_title = f"Topic #{topic_id}"
+                    topic_title = stored['title'] if (stored and stored.get('title')) else f"Topic #{topic_id}"
                 save_forum_topic(dest_id, topic_id, topic_title)
-                USER_STATES[user_id]['topic_id'] = topic_id
-                USER_STATES[user_id]['topic_title'] = topic_title
-                await event.respond(f"✅ Selected Topic: <b>{topic_title}</b> (ID: <code>{topic_id}</code>).\nStarting upload...", parse_mode='html')
-                await start_confirmed_download(event, user_id)
-            except ValueError:
-                await event.respond("❌ <b>Invalid ID.</b>\nPlease send a valid numeric Topic ID (e.g. <code>8</code> or <code>8 My Topic</code>).", parse_mode='html')
-    else:
-        # Direct URL pasting support without pressing buttons first
-        if text.startswith('http://') or text.startswith('https://'):
-            domain, service, cur_id, post_id = parse_media_url(text)
-            if domain:
-                if post_id:
-                    # Single video / file
-                    USER_STATES[user_id] = {
-                        'url': text,
-                        'range': None,
-                        'dest': STORAGE_CHANNEL_ID
-                    }
-                    if len(STORAGE_CHANNELS) > 1:
-                        buttons = [
-                            [Button.inline("🚀 Quick Download (Default)", b"quick_download_confirm")],
-                            [Button.inline("📍 Select Destination / Topic", b"quick_choose_dest")],
-                            [Button.inline("❌ Cancel", b"cancel_flow")]
-                        ]
-                    else:
-                        buttons = [
-                            [Button.inline("🚀 Download Now", b"quick_download_confirm")],
-                            [Button.inline("🧵 Topic Options", b"quick_dest_topic")],
-                            [Button.inline("📍 Custom Channel", b"dest_custom")],
-                            [Button.inline("❌ Cancel", b"cancel_flow")]
-                        ]
+
+                if USER_STATES[user_id].get('standalone') or 'url' not in USER_STATES[user_id]:
+                    USER_STATES.pop(user_id, None)
                     await event.respond(
-                        f"🎬 <b>Single Media Detected!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"• <b>Platform:</b> {service.capitalize()}\n"
-                        f"• <b>ID:</b> <code>{cur_id}</code>\n"
-                        f"• <b>Destination:</b> Storage Channel\n\n"
-                        f"Start download & upload to Telegram?",
+                        "<b>✅ Topic Registered</b>\n"
+                        f"<blockquote><b>Title:</b> {_esc(topic_title)}\n<b>ID:</b> <code>{topic_id}</code></blockquote>",
                         parse_mode='html',
-                        buttons=buttons
+                        buttons=[[
+                            Button.inline("📑 Topics", f"topics_refresh:{dest_id}".encode()),
+                            Button.inline("🏠 Menu", b"main_menu"),
+                        ]],
                     )
                 else:
-                    # Album or creator profile
-                    USER_STATES[user_id] = {'url': text, 'state': 'WAITING_RANGE'}
-                    await event.respond(
-                        f"📁 <b>{service.capitalize()} Album/Profile Detected!</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"• <b>Source:</b> <code>{text[:60]}...</code>\n\n"
-                        f"Do you want to browse files, download all, or specify a page range?",
-                        parse_mode='html',
-                        buttons=[
-                            [Button.inline("📋 Browse & Select Files", b"crawl_album")],
-                            [Button.inline("📄 All Pages / Videos", b"range_all")],
-                            [Button.inline("🔢 Custom Range", b"range_custom")],
-                            [Button.inline("❌ Cancel", b"cancel_flow")]
-                        ]
-                    )
-            else:
+                    USER_STATES[user_id]['topic_id'] = topic_id
+                    USER_STATES[user_id]['topic_title'] = topic_title
+                    await start_confirmed_download(event, user_id)
+            except ValueError:
                 await event.respond(
-                    "❌ <b>Unsupported URL format.</b>\n"
-                    "Supported formats:\n"
-                    "• <code>https://xmoviesforyou.com/page/7</code>\n"
-                    "• <code>https://xmoviesforyou.com/devilsfilm-serena-sterling-deepthroat-diagnosis</code>\n"
-                    "• <code>https://uxseries.co/actress/bharti-jha/</code>\n"
-                    "• <code>https://hdmaal.movie/model/bharti-jha/</code>\n"
-                    "• <code>https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
-                    "• <code>https://uxseries.co/series/shatir/</code>\n"
-                    "• <code>https://uxseries.co/episode/shatir-episode-1/</code>\n"
-                    "• <code>https://viralchut.com/video-slug/</code>\n"
-                    "• <code>https://viralchut.com/category/name/</code>\n"
-                    "• <code>https://bunkr.cr/a/album_id</code>\n"
-                    "• <code>https://bunkr.cr/v/video_id</code>\n"
-                    "• <code>https://coomer.st/onlyfans/user/...</code>",
-                    parse_mode='html'
+                    "❌ <b>Invalid Topic ID</b>\nSend a numeric ID like <code>8</code> or <code>8 My Topic</code>.",
+                    parse_mode='html',
+                    buttons=[[Button.inline("✕ Cancel", b"cancel_flow")]],
                 )
+    elif is_url:
+        await prompt_url_options(event, user_id, text)
+
 
 async def ask_destination(event, user_id):
     USER_STATES[user_id]['state'] = 'WAITING_CHANNEL'
+    info = USER_STATES[user_id]
+    if info.get('selected_videos'):
+        item_desc = f"{len(info['selected_videos'])} selected item(s)"
+    elif info.get('range'):
+        item_desc = f"Pages {_esc(info['range'])}"
+    else:
+        item_desc = "All items" if not info.get('dest') else "Single item"
+
     buttons = []
     if len(STORAGE_CHANNELS) <= 1:
-        buttons.append([Button.inline("📌 Default Group/Channel", b"dest_default")])
-        buttons.append([Button.inline("🧵 Topic in Default Group", b"dest_default_topic")])
+        if STORAGE_CHANNEL_ID:
+            name = await get_chat_title_cached(STORAGE_CHANNEL_ID)
+            is_forum = await is_forum_chat(STORAGE_CHANNEL_ID)
+            badge = "🧵" if is_forum else "📌"
+            buttons.append([Button.inline(f"{badge} {name[:26]}", b"dest_default")])
     else:
         for idx, cid in enumerate(STORAGE_CHANNELS):
             name = await get_chat_title_cached(cid)
             is_forum = await is_forum_chat(cid)
-            label = f"📌 {name[:20]}" if name else f"📌 Channel {idx+1}"
-            row = [Button.inline(label, f"dest_pick:{cid}".encode())]
-            if is_forum:
-                row.append(Button.inline("🧵 Topics", f"dest_topic_pick:{cid}".encode()))
-            buttons.append(row)
+            badge = "🧵" if is_forum else "📌"
+            label = f"{badge} {name[:26]}" if name else f"{badge} Channel {idx + 1}"
+            buttons.append([Button.inline(label, f"dest_pick:{cid}".encode())])
 
     buttons.append([Button.inline("🆔 Custom Channel ID", b"dest_custom")])
-    buttons.append([Button.inline("❌ Cancel", b"cancel_flow")])
-    
-    desc_text = "Where should I upload the videos?\n"
-    if len(STORAGE_CHANNELS) > 1:
-        desc_text += "• <b>Configured Channels:</b> Select one from the buttons below\n"
-    else:
-        desc_text += "• <b>Default:</b> Auto-detects if group has topics\n• <b>Topic:</b> Create or choose topic in default group\n"
-    desc_text += "• <b>Custom:</b> Enter another channel or group ID"
+    buttons.append([
+        Button.inline("‹ Back", b"back_from_dest"),
+        Button.inline("✕ Cancel", b"cancel_flow"),
+    ])
 
-    await event.respond(
-        "📍 <b>Step 3: Choose Destination</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n" + desc_text, 
-        parse_mode='html', 
-        buttons=buttons
+    text = (
+        "<b>📍 Choose Destination</b>\n"
+        f"<blockquote><b>Queued:</b> {item_desc}</blockquote>\n\n"
+        "Select where to upload (forum groups open topic picker):"
     )
+    await _render_or_edit(event, text, buttons=buttons)
 
-async def start_confirmed_download(event, user_id):
+
+async def start_confirmed_download(event, user_id, status_msg=None):
     info = USER_STATES.pop(user_id, None)
-    if not info: return
+    if not info:
+        return
     url = info['url']
     page_range = info.get('range')
     dest = info.get('dest', STORAGE_CHANNEL_ID)
     selected_videos = info.get('selected_videos')
     topic_id = info.get('topic_id')
     topic_title = info.get('topic_title')
-    
-    topic_info = f"\n🧵 <b>Topic:</b> {topic_title} (<code>{topic_id}</code>)" if topic_id else ""
-    if selected_videos:
-        await event.respond(
-            f"✅ <b>Starting Download!</b>\n\n"
-            f"🔗 <b>Source:</b> {url}\n"
-            f"📦 <b>Selected Files:</b> {len(selected_videos)} items\n"
-            f"📍 <b>Destination:</b> <code>{dest}</code>{topic_info}",
-            parse_mode='html'
-        )
-        asyncio.create_task(download_and_upload(event, url, None, dest, selected_videos=selected_videos, topic_id=topic_id))
+
+    dest_name = await get_chat_title_cached(dest) if dest else str(dest)
+    items_label = f"{len(selected_videos)} selected" if selected_videos else _esc(page_range or "All")
+    target_label = _esc(dest_name) + (f" · {_esc(topic_title)}" if topic_title else "")
+
+    initial_text = (
+        "<b>🚀 Starting Pipeline</b>\n"
+        f"<blockquote><b>Source:</b> <code>{_esc(_shorten_url(url, 46))}</code>\n"
+        f"<b>Items:</b> {items_label}\n"
+        f"<b>Target:</b> {target_label}</blockquote>"
+    )
+    cancel_markup = [[Button.inline("🛑 Cancel Task", b"cancel_task")]]
+
+    if status_msg is not None:
+        try:
+            await status_msg.edit(initial_text, parse_mode='html', buttons=cancel_markup, link_preview=False)
+        except Exception:
+            status_msg = await event.respond(initial_text, parse_mode='html', buttons=cancel_markup, link_preview=False)
     else:
-        await event.respond(
-            f"✅ <b>Starting Download!</b>\n\n"
-            f"🔗 <b>Source:</b> {url}\n"
-            f"📄 <b>Range:</b> {page_range or 'All'}\n"
-            f"📍 <b>Destination:</b> <code>{dest}</code>{topic_info}",
-            parse_mode='html'
-        )
-        asyncio.create_task(download_and_upload(event, url, page_range, dest, topic_id=topic_id))
+        status_msg = await _render_or_edit(event, initial_text, buttons=cancel_markup)
 
-@client.on(events.NewMessage(pattern=r"^/download(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+    asyncio.create_task(
+        download_and_upload(
+            event,
+            url,
+            None if selected_videos else page_range,
+            dest,
+            selected_videos=selected_videos,
+            topic_id=topic_id,
+            status_msg=status_msg,
+        )
+    )
+
+
+async def _dispatch_url_command(event, url: str | None, page_range: str | None, usage_text: str):
+    if not await check_admin_or_notify(event):
+        return
+    if not url:
+        await event.respond(usage_text, parse_mode='html', link_preview=False)
+        return
+    dest_id, topic_id = _extract_target_and_topic(event)
+    asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
+
+
+@client.on(events.NewMessage(pattern=r"^/download(?:@\S+)?(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def download_handler(event):
-    if not await check_admin_or_notify(event): return
-    url = event.pattern_match.group(1)
-    page_range = event.pattern_match.group(2)
-    if not url:
-        await event.respond(
-            "📥 <b>How to Download:</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Simply <b>paste any link</b> directly into this chat, or use:\n\n"
-            "• <code>/download &lt;url&gt;</code> - Download all items\n"
-            "• <code>/download &lt;url&gt; &lt;pages&gt;</code> - Download specific pages (e.g. <code>1-3</code>)\n"
-            "• <code>/crawl &lt;url&gt;</code> - Crawl & select videos from any webpage\n\n"
-            "<b>Supported Platforms:</b>\n"
-            "• <b>Universal Web:</b> Any website, tube, blog, gallery, or direct media\n"
-            "• <b>Viralchut:</b> Single videos, Categories, Tags, Search\n"
-            "• <b>Bunkr:</b> Albums (<code>/a/</code>) & Videos (<code>/v/</code>, <code>/f/</code>)\n"
-            "• <b>Coomer / Kemono:</b> Creator profiles & single posts",
-            parse_mode='html'
-        )
-        return
-    dest_id = STORAGE_CHANNEL_ID
-    topic_id = None
-    if event.is_group:
-        dest_id = event.chat_id
-        if getattr(event.message, 'reply_to', None):
-            topic_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
-    asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
+    await _dispatch_url_command(
+        event,
+        event.pattern_match.group(1),
+        event.pattern_match.group(2),
+        "<b>📥 Download Usage</b>\n"
+        "<blockquote><code>/download &lt;url&gt;</code> — Download all items\n"
+        "<code>/download &lt;url&gt; 1-3</code> — Download pages 1–3</blockquote>\n\n"
+        "Or simply paste any URL directly in chat.",
+    )
 
-@client.on(events.NewMessage(pattern=r"^/pimpbunny(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+
+@client.on(events.NewMessage(pattern=r"^/pimpbunny(?:@\S+)?(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def pimpbunny_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    url = event.pattern_match.group(1)
-    page_range = event.pattern_match.group(2)
-    if not url:
-        await event.respond(
-            "🐰 <b>PimpBunny Scraper</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Usage:\n"
-            "• <code>/pimpbunny https://pimpbunny.com/videos/video-slug/</code>\n"
-            "• <code>/pimpbunny https://pimpbunny.com/onlyfans-creators/model-slug/</code>\n"
-            "• <code>/pimpbunny https://pimpbunny.com/categories/bbc/</code>\n"
-            "• <code>/pimpbunny https://pimpbunny.com/ 1-3</code>\n\n"
-            "Or simply paste any PimpBunny link directly into this chat!",
-            parse_mode='html'
-        )
-        return
-    dest_id = STORAGE_CHANNEL_ID
-    topic_id = None
-    if event.is_group:
-        dest_id = event.chat_id
-        if getattr(event.message, 'reply_to', None):
-            topic_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
-    asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
+    await _dispatch_url_command(
+        event,
+        event.pattern_match.group(1),
+        event.pattern_match.group(2),
+        "<b>🐰 PimpBunny</b>\n<blockquote><code>/pimpbunny &lt;url&gt; [pages]</code></blockquote>",
+    )
 
-@client.on(events.NewMessage(pattern=r"^/uxseries(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+
+@client.on(events.NewMessage(pattern=r"^/uxseries(?:@\S+)?(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def uxseries_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    url = event.pattern_match.group(1)
-    page_range = event.pattern_match.group(2)
-    if not url:
-        await event.respond(
-            "✨ <b>UXSeries Scraper</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Scrape HD Web Series, Actresses, Episodes & Platforms from UXSeries!\n\n"
-            "<b>Usage:</b>\n"
-            "• <code>/uxseries https://uxseries.co/actress/bharti-jha/</code>\n"
-            "• <code>/uxseries https://uxseries.co/actress/bharti-jha/ 1-2</code>\n"
-            "• <code>/uxseries https://uxseries.co/series/shatir/</code>\n"
-            "• <code>/uxseries https://uxseries.co/episode/shatir-episode-1/</code>\n"
-            "• <code>/uxseries https://uxseries.co/platform/ullu/</code>\n\n"
-            "Or simply paste any UXSeries link directly into this chat!",
-            parse_mode='html'
-        )
-        return
-    dest_id = STORAGE_CHANNEL_ID
-    topic_id = None
-    if event.is_group:
-        dest_id = event.chat_id
-        if getattr(event.message, 'reply_to', None):
-            topic_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
-    asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
+    await _dispatch_url_command(
+        event,
+        event.pattern_match.group(1),
+        event.pattern_match.group(2),
+        "<b>✨ UXSeries</b>\n<blockquote><code>/uxseries &lt;url&gt; [pages]</code></blockquote>",
+    )
 
-@client.on(events.NewMessage(pattern=r"^/hdmaal(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+
+@client.on(events.NewMessage(pattern=r"^/hdmaal(?:@\S+)?(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def hdmaal_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    url = event.pattern_match.group(1)
-    page_range = event.pattern_match.group(2)
-    if not url:
-        await event.respond(
-            "🎬 <b>HDMaal Scraper</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Scrape 18+ Web Series, Models, Episodes & OTTs from HDMaal!\n\n"
-            "<b>Usage:</b>\n"
-            "• <code>/hdmaal https://hdmaal.movie/model/bharti-jha/</code>\n"
-            "• <code>/hdmaal https://hdmaal.movie/model/bharti-jha/ 1-2</code>\n"
-            "• <code>/hdmaal https://hdmaal.movie/jaan-bujh-kar-s2-episode-5/</code>\n"
-            "• <code>/hdmaal https://hdmaal.movie/ott/voovi/</code>\n\n"
-            "Or simply paste any HDMaal link directly into this chat!",
-            parse_mode='html'
-        )
-        return
-    dest_id = STORAGE_CHANNEL_ID
-    topic_id = None
-    if event.is_group:
-        dest_id = event.chat_id
-        if getattr(event.message, 'reply_to', None):
-            topic_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
-    asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
+    await _dispatch_url_command(
+        event,
+        event.pattern_match.group(1),
+        event.pattern_match.group(2),
+        "<b>🎬 HDMaal</b>\n<blockquote><code>/hdmaal &lt;url&gt; [pages]</code></blockquote>",
+    )
 
-@client.on(events.NewMessage(pattern=r"^/xmovies(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+
+@client.on(events.NewMessage(pattern=r"^/xmovies(?:@\S+)?(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def xmovies_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    url = event.pattern_match.group(1)
-    page_range = event.pattern_match.group(2)
-    if not url:
-        await event.respond(
-            "🎬 <b>XMoviesForYou Scraper</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Scrape HD Videos, Studios, Pornstars, Categories & Playlists from XMoviesForYou!\n\n"
-            "<b>Usage:</b>\n"
-            "• <code>/xmovies https://xmoviesforyou.com/page/7</code>\n"
-            "• <code>/xmovies https://xmoviesforyou.com/page/7 7-8</code>\n"
-            "• <code>/xmovies https://xmoviesforyou.com/devilsfilm-serena-sterling-deepthroat-diagnosis</code>\n"
-            "• <code>/xmovies https://xmoviesforyou.com/studio/devilsfilm</code>\n"
-            "• <code>/xmovies https://xmoviesforyou.com/pornstar/serena-sterling</code>\n\n"
-            "Or simply paste any XMoviesForYou link directly into this chat!",
-            parse_mode='html'
-        )
-        return
-    dest_id = STORAGE_CHANNEL_ID
-    topic_id = None
-    if event.is_group:
-        dest_id = event.chat_id
-        if getattr(event.message, 'reply_to', None):
-            topic_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
-    asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
+    await _dispatch_url_command(
+        event,
+        event.pattern_match.group(1),
+        event.pattern_match.group(2),
+        "<b>🎥 XMoviesForYou</b>\n<blockquote><code>/xmovies &lt;url&gt; [pages]</code></blockquote>",
+    )
 
-@client.on(events.NewMessage(pattern=r"^/crawl(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+
+@client.on(events.NewMessage(pattern=r"^/bunkr(?:@\S+)?(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
+async def bunkr_command_handler(event):
+    await _dispatch_url_command(
+        event,
+        event.pattern_match.group(1),
+        event.pattern_match.group(2),
+        "<b>⚡ Bunkr</b>\n<blockquote><code>/bunkr &lt;url&gt; [pages]</code></blockquote>",
+    )
+
+
+@client.on(events.NewMessage(pattern=r"^/crawl(?:@\S+)?(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
 async def crawl_command_handler(event):
-    if not await check_admin_or_notify(event): return
+    if not await check_admin_or_notify(event):
+        return
     url = event.pattern_match.group(1)
     page_range = event.pattern_match.group(2)
     if not url:
         await event.respond(
-            "🕷️ <b>Universal Web Video Crawler</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Crawl and scrape video links from <b>any</b> website, gallery, blog, tube, or profile!\n\n"
-            "<b>Usage:</b>\n"
-            "• <code>/crawl https://example.com/gallery/</code>\n"
-            "• <code>/crawl https://example.com/videos/ 1-3</code>\n\n"
-            "Or simply paste any URL directly into this chat!",
-            parse_mode='html'
+            "<b>🕷️ Crawl & Select</b>\n"
+            "<blockquote><code>/crawl &lt;url&gt; [pages]</code></blockquote>\n\n"
+            "Scans any webpage and lets you pick specific videos.",
+            parse_mode='html',
+            link_preview=False,
         )
         return
 
     user_id = event.sender_id
     USER_STATES[user_id] = {'url': url, 'range': page_range, 'dest': STORAGE_CHANNEL_ID}
-    status_m = await event.respond("⏳ <b>Crawling Webpage for Videos...</b>\nScanning source and extracting file list, please wait...", parse_mode='html')
+    status_m = await event.respond(
+        f"<b>⏳ Scanning Page</b>\n<blockquote><code>{_esc(_shorten_url(url, 48))}</code></blockquote>",
+        parse_mode='html',
+        link_preview=False,
+    )
     try:
         domain, service, cur_id, post_id = parse_media_url(url)
         pr = parse_page_range(page_range) if page_range else None
         posts = await fetch_all_posts(domain, service, cur_id, page_range=pr, post_id=None)
         if not posts:
-            await status_m.edit("❌ <b>No videos found on this webpage.</b>", parse_mode='html')
+            await status_m.edit("❌ <b>No posts found on this page.</b>", parse_mode='html', link_preview=False)
             return
         videos = extract_video_urls(domain, posts)
         if not videos:
-            await status_m.edit("⚠️ <b>No downloadable videos found on this webpage.</b>", parse_mode='html')
+            await status_m.edit("⚠️ <b>No downloadable videos found.</b>", parse_mode='html', link_preview=False)
             return
         USER_STATES[user_id]['videos'] = videos
         USER_STATES[user_id]['selected'] = set()
         USER_STATES[user_id]['browser_page'] = 0
         text, buttons = render_album_browser(user_id)
-        await status_m.edit(text, parse_mode='html', buttons=buttons)
+        await status_m.edit(text, parse_mode='html', buttons=buttons, link_preview=False)
     except Exception as e:
         logger.error(f"Error crawling webpage: {e}")
-        await status_m.edit(f"❌ <b>Error crawling webpage:</b> {e}", parse_mode='html')
-
-@client.on(events.NewMessage(pattern=r"^/bunkr(?:\s+(https?://\S+)(?:\s+([\d-]+))?)?$"))
-async def bunkr_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    url = event.pattern_match.group(1)
-    page_range = event.pattern_match.group(2)
-    if not url:
-        await event.respond(
-            "⚡ <b>Bunkr Downloader</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Usage:\n"
-            "• <code>/bunkr https://bunkr.cr/a/album_id</code>\n"
-            "• <code>/bunkr https://bunkr.cr/v/video_id</code>\n\n"
-            "Or simply paste any Bunkr URL directly into this chat!",
-            parse_mode='html'
+        await status_m.edit(
+            f"❌ <b>Scan Error</b>\n<blockquote><code>{_esc(e)}</code></blockquote>",
+            parse_mode='html',
+            link_preview=False,
         )
-        return
-    dest_id = STORAGE_CHANNEL_ID
-    topic_id = None
-    if event.is_group:
-        dest_id = event.chat_id
-        if getattr(event.message, 'reply_to', None):
-            topic_id = getattr(event.message.reply_to, 'reply_to_top_id', None) or getattr(event.message.reply_to, 'reply_to_msg_id', None)
-    asyncio.create_task(download_and_upload(event, url, page_range, dest_id, topic_id=topic_id))
 
-@client.on(events.NewMessage(pattern=r"^/stats$"))
+
+@client.on(events.NewMessage(pattern=r"^/stats(?:@\S+)?$"))
 async def stats_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    total_idx = await _get_supabase_media_count()
-    stat_text = (
-        "📊 <b>Uploader & Storage Overview</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Active Tasks:</b> <code>{len(RUNNING_TASKS)}</code>\n"
-        f"• <b>Storage Channel:</b> <code>{STORAGE_CHANNEL_ID}</code>\n"
-        f"• <b>Indexed Videos:</b> <code>{total_idx}</code>\n"
-        f"• <b>Mistral AI:</b> {'⚡ Active' if MISTRAL_API_KEY else '⚪ Disabled'}\n"
-        f"• <b>Stream Mode:</b> {'⚡ Zero-Disk Streaming' if ENABLE_STREAM_UPLOAD else '💾 Disk Queue'}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    await event.respond(stat_text, parse_mode='html', buttons=[[Button.inline("🏠 Main Menu", b"main_menu")]])
+    if not await check_admin_or_notify(event):
+        return
+    text, buttons = await _build_stats_view()
+    await event.respond(text, parse_mode='html', buttons=buttons, link_preview=False)
+
+
+@client.on(events.NewMessage(pattern=r"^/cancel(?:@\S+)?$"))
+async def cancel_command_handler(event):
+    if not await check_admin_or_notify(event):
+        return
+    user_id = event.sender_id
+    had_state = USER_STATES.pop(user_id, None) is not None
+    task = RUNNING_TASKS.get(user_id)
+    if task:
+        task.cancel()
+        await event.respond("🛑 <b>Cancelling active task…</b>", parse_mode='html')
+    elif had_state:
+        await event.respond(
+            "<b>✕ Cancelled</b>",
+            parse_mode='html',
+            buttons=[[Button.inline("🏠 Menu", b"main_menu")]],
+        )
+    else:
+        await event.respond(
+            "ℹ️ <b>Nothing active to cancel.</b>",
+            parse_mode='html',
+            buttons=[[Button.inline("🏠 Menu", b"main_menu")]],
+        )
+
 
 @client.on(events.NewMessage(pattern=r"^/newtopic(?:@\S+)?(?:\s+(.+))?$"))
 async def newtopic_command_handler(event):
-    if not await check_admin_or_notify(event): return
+    if not await check_admin_or_notify(event):
+        return
     title = event.pattern_match.group(1)
     if not title:
         await event.respond(
-            "ℹ️ <b>Usage:</b> <code>/newtopic &lt;Title&gt;</code>\n\n"
-            "Creates a new forum topic in your forum group.\n"
-            "<i>Example:</i> <code>/newtopic Serena Sterling</code>",
-            parse_mode='html'
+            "<b>➕ New Topic</b>\n<blockquote><code>/newtopic &lt;title&gt;</code></blockquote>",
+            parse_mode='html',
         )
         return
 
-    dest_id = STORAGE_CHANNEL_ID
-    if event.is_group:
-        dest_id = event.chat_id
-    else:
-        for c in STORAGE_CHANNELS:
-            if await is_forum_chat(c):
-                dest_id = c
-                break
-
-    status_m = await event.respond(f"⏳ Creating topic <b>{title}</b> in group <code>{dest_id}</code>...", parse_mode='html')
+    dest_id = await _resolve_forum_dest(event)
+    status_m = await event.respond(
+        f"⏳ Creating topic <b>{_esc(title)}</b>…",
+        parse_mode='html',
+        link_preview=False,
+    )
     try:
         topic_id = await create_forum_topic_helper(dest_id, title)
         if topic_id:
             save_forum_topic(dest_id, topic_id, title)
-            clean_id = str(abs(dest_id))
-            if clean_id.startswith("100"): clean_id = clean_id[3:]
-            topic_link = f"https://t.me/c/{clean_id}/{topic_id}"
+            topic_link = _telegram_channel_url(dest_id, topic_id)
+            link_line = f"\n<b>Link:</b> <a href=\"{topic_link}\">Open Topic</a>" if topic_link else ""
             await status_m.edit(
-                f"✅ <b>Topic Created Successfully!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"• <b>Title:</b> {title}\n"
-                f"• <b>Topic ID:</b> <code>{topic_id}</code>\n"
-                f"• <b>Group:</b> <code>{dest_id}</code>\n"
-                f"• <b>Link:</b> <a href=\"{topic_link}\">Open Topic</a>\n\n"
-                "Saved! It will now appear in 📑 <b>Choose Existing Topic</b>.",
-                parse_mode='html'
+                "<b>✅ Topic Created</b>\n"
+                f"<blockquote><b>Title:</b> {_esc(title)}\n"
+                f"<b>ID:</b> <code>{topic_id}</code>\n"
+                f"<b>Group:</b> <code>{dest_id}</code>{link_line}</blockquote>",
+                parse_mode='html',
+                buttons=[[Button.inline("📑 Topics", f"topics_refresh:{dest_id}".encode())]],
+                link_preview=False,
             )
         else:
-            await status_m.edit("❌ Failed to obtain topic ID. Check bot permissions in the group.")
+            await status_m.edit("❌ Failed to obtain topic ID. Check bot permissions.", parse_mode='html')
     except Exception as e:
         await status_m.edit(
-            f"❌ <b>Error creating topic:</b> <code>{e}</code>\n\n"
-            "<i>Ensure the bot is an Admin with 'Manage Topics' permission in the group.</i>",
-            parse_mode='html'
+            f"❌ <b>Topic Creation Failed</b>\n<blockquote><code>{_esc(e)}</code></blockquote>",
+            parse_mode='html',
         )
+
 
 @client.on(events.NewMessage(pattern=r"^/addtopic(?:@\S+)?(?:\s+(\d+)(?:\s+(.+))?)?$"))
 async def addtopic_command_handler(event):
-    if not await check_admin_or_notify(event): return
+    if not await check_admin_or_notify(event):
+        return
     topic_id_str = event.pattern_match.group(1)
     topic_title = event.pattern_match.group(2)
     if not topic_id_str:
         await event.respond(
-            "ℹ️ <b>Usage:</b> <code>/addtopic &lt;Topic_ID&gt; [Title]</code>\n\n"
-            "Registers an existing forum topic so it appears in the bot's topic selector.\n"
-            "<i>Example:</i> <code>/addtopic 8 Charli O</code>",
-            parse_mode='html'
+            "<b>📌 Register Topic</b>\n<blockquote><code>/addtopic &lt;topic_id&gt; [title]</code></blockquote>",
+            parse_mode='html',
         )
         return
 
     topic_id = int(topic_id_str)
     topic_title = topic_title.strip() if topic_title else f"Topic #{topic_id}"
-    dest_id = event.chat_id if event.is_group else STORAGE_CHANNEL_ID
-    if not event.is_group:
-        for c in STORAGE_CHANNELS:
-            if await is_forum_chat(c):
-                dest_id = c
-                break
+    dest_id = await _resolve_forum_dest(event)
 
     save_forum_topic(dest_id, topic_id, topic_title)
     await event.respond(
-        f"✅ <b>Topic Registered!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Group:</b> <code>{dest_id}</code>\n"
-        f"• <b>Topic ID:</b> <code>{topic_id}</code>\n"
-        f"• <b>Title:</b> {topic_title}\n\n"
-        "It will now appear in the 📑 <b>Choose Existing Topic</b> menu!",
-        parse_mode='html'
+        "<b>✅ Topic Registered</b>\n"
+        f"<blockquote><b>Title:</b> {_esc(topic_title)}\n"
+        f"<b>ID:</b> <code>{topic_id}</code>\n"
+        f"<b>Group:</b> <code>{dest_id}</code></blockquote>",
+        parse_mode='html',
+        buttons=[[Button.inline("📑 Topics", f"topics_refresh:{dest_id}".encode())]],
     )
+
 
 @client.on(events.NewMessage(pattern=r"^/deltopic(?:@\S+)?(?:\s+(\d+))?$"))
 async def deltopic_command_handler(event):
-    if not await check_admin_or_notify(event): return
+    if not await check_admin_or_notify(event):
+        return
     topic_id_str = event.pattern_match.group(1)
     if not topic_id_str:
         await event.respond(
-            "ℹ️ <b>Usage:</b> <code>/deltopic &lt;Topic_ID&gt;</code>\n\n"
-            "Removes a topic from the bot's selector list.\n"
-            "<i>Example:</i> <code>/deltopic 8</code>",
-            parse_mode='html'
+            "<b>🗑️ Remove Topic</b>\n<blockquote><code>/deltopic &lt;topic_id&gt;</code></blockquote>",
+            parse_mode='html',
         )
         return
 
     topic_id = int(topic_id_str)
-    dest_id = event.chat_id if event.is_group else STORAGE_CHANNEL_ID
-    if not event.is_group:
-        for c in STORAGE_CHANNELS:
-            if await is_forum_chat(c):
-                dest_id = c
-                break
+    dest_id = await _resolve_forum_dest(event)
 
     delete_forum_topic(dest_id, topic_id)
     await event.respond(
-        f"🗑️ Removed Topic ID <code>{topic_id}</code> from group <code>{dest_id}</code>.",
-        parse_mode='html'
+        f"🗑️ Removed Topic <code>{topic_id}</code> from group <code>{dest_id}</code>.",
+        parse_mode='html',
     )
+
 
 @client.on(events.NewMessage(pattern=r"^/topics(?:@\S+)?$"))
 async def topics_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    dest_id = STORAGE_CHANNEL_ID
-    if event.is_group:
-        dest_id = event.chat_id
-    else:
-        for c in STORAGE_CHANNELS:
-            if await is_forum_chat(c):
-                dest_id = c
-                break
-
-    status_m = await event.respond(f"⏳ Fetching topics from group <code>{dest_id}</code>...", parse_mode='html')
+    if not await check_admin_or_notify(event):
+        return
+    dest_id = await _resolve_forum_dest(event)
+    status_m = await event.respond(
+        f"⏳ Loading topics for <code>{dest_id}</code>…",
+        parse_mode='html',
+    )
     try:
-        topics = await get_forum_topics_list(dest_id, limit=30)
-        if not topics:
-            await status_m.edit(
-                f"⚠️ <b>No topics found for group <code>{dest_id}</code>.</b>\n\n"
-                "• Use <code>/addtopic &lt;id&gt; &lt;name&gt;</code> to register an existing topic.\n"
-                "• Or use <code>/newtopic &lt;title&gt;</code> to create a new one.\n"
-                "• Or talk in that topic in the group so the bot auto-registers it!",
-                parse_mode='html'
-            )
-            return
-
-        chat_name = await get_chat_title_cached(dest_id)
-        clean_id = str(abs(dest_id))
-        if clean_id.startswith("100"): clean_id = clean_id[3:]
-
-        text = (
-            f"📑 <b>Forum Topics in {chat_name} (<code>{dest_id}</code>):</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        )
-
-        for t in topics:
-            link = f"https://t.me/c/{clean_id}/{t['id']}"
-            status = "🔒 Closed" if t.get('closed') else "🟢 Active"
-            text += f"• <a href=\"{link}\"><b>{t['title']}</b></a> (ID: <code>{t['id']}</code>) - {status}\n"
-
-        text += (
-            "\n💡 <i>Commands:</i>\n"
-            "• <code>/addtopic &lt;id&gt; &lt;title&gt;</code> - Register existing topic\n"
-            "• <code>/newtopic &lt;title&gt;</code> - Create new topic\n"
-            "• <code>/deltopic &lt;id&gt;</code> - Remove from list"
-        )
-        await status_m.edit(text, parse_mode='html')
+        text, buttons = await _render_topics_list_view(dest_id)
+        await status_m.edit(text, parse_mode='html', buttons=buttons, link_preview=False)
     except Exception as e:
-        await status_m.edit(f"❌ <b>Error fetching topics:</b> <code>{e}</code>", parse_mode='html')
+        await status_m.edit(
+            f"❌ <b>Error Loading Topics</b>\n<blockquote><code>{_esc(e)}</code></blockquote>",
+            parse_mode='html',
+        )
+
 
 @client.on(events.NewMessage(pattern=r"^/id(?:@\S+)?$"))
 async def id_command_handler(event):
@@ -2502,22 +2692,17 @@ async def id_command_handler(event):
             if str(topic_id) not in stored:
                 save_forum_topic(chat_id, topic_id, f"Topic #{topic_id}")
 
-    text = (
-        "🆔 <b>Chat & ID Information</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Chat Name:</b> {chat_title}\n"
-        f"• <b>Chat ID:</b> <code>{chat_id}</code>\n"
-        f"• <b>Chat Type:</b> {'Supergroup / Channel' if is_group else 'Private Chat'}\n"
-        f"• <b>Forum Topics Enabled:</b> {'🟢 Yes' if is_forum else '⚪ No'}\n"
-    )
+    lines = [
+        "<b>🆔 Chat Info</b>",
+        f"<blockquote><b>Chat:</b> {_esc(chat_title)}",
+        f"<b>Chat ID:</b> <code>{chat_id}</code>",
+        f"<b>Type:</b> {'Group / Channel' if is_group else 'Private'}  ·  <b>Forum:</b> {'🟢 Yes' if is_forum else '⚪ No'}",
+    ]
     if topic_id:
-        text += f"• <b>Current Topic ID:</b> <code>{topic_id}</code>\n"
-    text += (
-        f"• <b>Your User ID:</b> <code>{user_id}</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 <i>Copy the Chat ID above to use in <code>STORAGE_CHANNEL_ID</code> in <code>.env</code>.</i>"
-    )
-    await event.respond(text, parse_mode='html')
+        lines.append(f"<b>Topic ID:</b> <code>{topic_id}</code>")
+    lines.append(f"<b>Your ID:</b> <code>{user_id}</code></blockquote>")
+    await event.respond("\n".join(lines), parse_mode='html', link_preview=False)
+
 
 @client.on(events.NewMessage())
 async def auto_track_topics_in_groups(event):
@@ -2538,53 +2723,27 @@ async def auto_track_topics_in_groups(event):
             if str(top_id) not in stored:
                 save_forum_topic(chat_id, top_id, f"Topic #{top_id}")
 
-@client.on(events.NewMessage(pattern=r"^/help$"))
+
+@client.on(events.NewMessage(pattern=r"^/help(?:@\S+)?$"))
 async def help_command_handler(event):
-    if not await check_admin_or_notify(event): return
-    help_text = (
-        "📖 <b>Help Guide</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>Commands:</b>\n"
-        "• /start - 🚀 Open main menu & status\n"
-        "• /download [url] - 📥 Download all items\n"
-        "• /crawl [url] - 🕷️ Crawl & select videos from any webpage\n"
-        "• /newtopic &lt;title&gt; - ➕ Create a new forum topic in group\n"
-        "• /addtopic &lt;id&gt; [title] - 📌 Register an existing topic in group\n"
-        "• /deltopic &lt;id&gt; - 🗑️ Remove topic from list\n"
-        "• /topics - 📑 List active forum topics in group\n"
-        "• /id - 🆔 Get chat ID, topic ID & user ID\n"
-        "• /uxseries [url] - ✨ Quick UXSeries scraper\n"
-        "• /hdmaal [url] - 🎬 Quick HDMaal scraper\n"
-        "• /xmovies [url] - 🎥 Quick XMoviesForYou scraper\n"
-        "• /viralchut [url] - 🔥 Quick Viralchut scraper\n"
-        "• /bunkr [url] - ⚡ Quick Bunkr scraper\n"
-        "• /stats - 📊 Storage & bot stats\n"
-        "• /help - ❓ Show this guide\n\n"
-        "<b>Topic Support:</b>\n"
-        "When uploading to a Telegram group with topics enabled, you can choose to create a new topic, pick an existing one, or upload to General chat."
-    )
-    await event.respond(help_text, parse_mode='html')
+    if not await check_admin_or_notify(event):
+        return
+    text, buttons = _build_help_view()
+    await event.respond(text, parse_mode='html', buttons=buttons, link_preview=False)
+
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 async def set_bot_commands():
     commands = [
-        BotCommand(command="start", description="🚀 Open main menu & status"),
-        BotCommand(command="download", description="📥 Download from any URL"),
-        BotCommand(command="crawl", description="🕷️ Crawl & select from any webpage"),
-        BotCommand(command="newtopic", description="➕ Create a new topic in group"),
-        BotCommand(command="addtopic", description="📌 Register an existing topic in group"),
-        BotCommand(command="deltopic", description="🗑️ Remove topic from list"),
-        BotCommand(command="topics", description="📑 List forum topics in group"),
-        BotCommand(command="id", description="🆔 Get chat ID, topic ID & user ID"),
-        BotCommand(command="xmovies", description="🎥 Quick XMoviesForYou scraper"),
-        BotCommand(command="uxseries", description="✨ Quick UXSeries scraper"),
-        BotCommand(command="hdmaal", description="🎬 Quick HDMaal scraper"),
-        BotCommand(command="pimpbunny", description="🐰 Quick PimpBunny scraper"),
-        BotCommand(command="viralchut", description="🔥 Quick Viralchut scraper"),
-        BotCommand(command="bunkr", description="⚡ Quick Bunkr downloader"),
-        BotCommand(command="stats", description="📊 Show uploader & storage stats"),
-        BotCommand(command="help", description="❓ Show help guide"),
+        BotCommand(command="start", description="Open main menu"),
+        BotCommand(command="download", description="Download media from URL"),
+        BotCommand(command="crawl", description="Browse and select files from URL"),
+        BotCommand(command="topics", description="Manage forum topics"),
+        BotCommand(command="stats", description="System and storage status"),
+        BotCommand(command="id", description="Show chat, topic, and user IDs"),
+        BotCommand(command="cancel", description="Cancel active task or prompt"),
+        BotCommand(command="help", description="Quick usage guide"),
     ]
     await client(functions.bots.SetBotCommandsRequest(
         scope=BotCommandScopeDefault(),

@@ -20,6 +20,7 @@ Usage in bot.py:
 
 from __future__ import annotations
 
+import html as html_lib
 import json
 import logging
 import re
@@ -57,15 +58,10 @@ def _pimpbunny_headers(referer: str = f"https://{DEFAULT_DOMAIN}/") -> Dict[str,
 
 
 def _is_bunny_shield_response(status_code: int, html: str) -> bool:
-    if status_code in (403, 429, 503):
-        low = html.lower()
-        return (
-            status_code == 403
-            or "bunny-shield" in low
-            or "shield-challenge" in low
-            or "establishing a secure connection" in low
-        )
-    return False
+    low = (html or "").lower()
+    return status_code == 403 or any(
+        k in low for k in ("bunny-shield", "shield-challenge", "establishing a secure connection")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -73,37 +69,24 @@ def _is_bunny_shield_response(status_code: int, html: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def parse_pimpbunny_url(url: str) -> Tuple[str, str, str, Optional[str]]:
-    """Parse a PimpBunny URL into ``(domain, service, user_id, post_id)``.
-
-    - ``https://pimpbunny.com/videos/<slug>``          -> single video (post_id = slug)
-    - ``https://pimpbunny.com/categories/<slug>``      -> catalog listing (post_id None)
-    - ``https://pimpbunny.com/onlyfans-creators/<slug>`` -> model listing (post_id None)
-    - ``https://pimpbunny.com/tags/<slug>``            -> tag listing (post_id None)
-    - homepage / bare section                          -> catalog listing (post_id None)
-    """
+    """Parse a PimpBunny URL into ``(domain, service, user_id, post_id)``."""
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
     parsed = urlparse(url)
     domain = parsed.netloc or DEFAULT_DOMAIN
-    path = parsed.path.rstrip("/")
-    parts = [p for p in path.split("/") if p]
+    parts = [p for p in parsed.path.rstrip("/").split("/") if p]
 
     if not parts or parts[0].isdigit():
         return domain, "pimpbunny", "home", None
 
     if parts[0] == "videos":
         if len(parts) > 1 and not parts[1].isdigit():
-            slug = parts[1]
-            return domain, "pimpbunny", slug, slug  # post_id = slug -> single video
+            return domain, "pimpbunny", parts[1], parts[1]
         return domain, "pimpbunny", "videos", None
 
-    if parts[0] in ("categories", "onlyfans-creators", "tags"):
-        if len(parts) > 1 and not parts[1].isdigit():
-            return domain, "pimpbunny", f"{parts[0]}/{parts[1]}", None
-        return domain, "pimpbunny", parts[0], None
-
-    return domain, "pimpbunny", "/".join(parts), None
+    listing_parts = parts[:-1] if len(parts) > 1 and parts[-1].isdigit() else parts
+    return domain, "pimpbunny", "/".join(listing_parts), None
 
 
 # ---------------------------------------------------------------------------
@@ -127,24 +110,27 @@ def _parse_iso_duration(value: Any) -> int:
 
 
 def extract_kvs_download_urls(html: str) -> List[Dict[str, Any]]:
-    """Extract tokenized KVS player video URLs (ordered with explicit heights)."""
-    labels: Dict[str, str] = {}
-    for m in re.finditer(r"(video_(?:alt_)?url\d*)_text\s*:\s*['\"]([^'\"]+)['\"]", html):
-        labels[m.group(1)] = m.group(2).strip()
+    """Extract tokenized KVS or Astro player video URLs (ordered with explicit heights)."""
+    labels = dict(re.findall(r"(video_(?:alt_)?url\d*)_text\s*:\s*['\"]([^'\"]+)['\"]", html))
+    matches = re.findall(r"(video_(?:alt_)?url\d*)\s*:\s*['\"](https?://[^'\"]+)['\"]", html)
+    matches += [
+        ("source", u)
+        for u in re.findall(r'https?://[^\s"\'<>\\]+/get_video/[^\s"\'<>\\]+', html_lib.unescape(html))
+    ]
 
     urls: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    for m in re.finditer(r"(video_(?:alt_)?url\d*)\s*:\s*['\"](https?://[^'\"]+)['\"]", html):
-        key, raw_url = m.group(1), m.group(2).replace("\\/", "/").strip()
-        if not raw_url or raw_url in seen or "_preview.mp4" in raw_url.lower():
+    for key, raw_url in matches:
+        clean = raw_url.replace("\\/", "/").strip()
+        if not clean or clean in seen or "_preview.mp4" in clean.lower():
             continue
-        seen.add(raw_url)
+        seen.add(clean)
         label = labels.get(key, "")
-        hm = re.search(r"(\d{3,4})p", label) or re.search(r"_(\d{3,4})p\.(?:mp4|webm)", raw_url, re.I)
+        hm = re.search(r"(\d{3,4})p", label) or re.search(r"_(\d{3,4})p\.(?:mp4|webm)", clean, re.I)
         height = int(hm.group(1)) if hm else 0
         urls.append({
             "quality": label or (f"{height}p" if height else key),
-            "url": raw_url,
+            "url": clean,
             "format_id": key,
             "height": height,
             "ext": "mp4",
@@ -184,17 +170,18 @@ def _parse_pimpbunny_video_html(url: str, html: str, service: str = "pimpbunny")
 
     if not title:
         og = soup.find("meta", property="og:title") or soup.find("h1")
-        title = (og.get("content") if og and og.has_attr("content") else og.get_text(strip=True)) if og else ""
+        raw_title = (og.get("content") if og and og.has_attr("content") else og.get_text(strip=True)) if og else ""
+        title = re.sub(r"\s*\|\s*PimpBunny$", "", raw_title, flags=re.I).strip()
     if not thumbnail:
         og_img = soup.find("meta", property="og:image")
         if og_img and og_img.get("content"):
             thumbnail = urljoin(url, og_img["content"].strip())
 
     model = None
-    model_link = soup.select_one("a[href*='/onlyfans-creators/']")
+    model_link = soup.find("a", href=re.compile(r"/(?:onlyfans-creators|models)/[^/?#]+"))
     if model_link:
         href_parts = [p for p in urlparse(model_link["href"]).path.split("/") if p]
-        if len(href_parts) >= 2 and href_parts[0] == "onlyfans-creators":
+        if len(href_parts) >= 2:
             model = href_parts[1].replace("-", " ").title()
 
     download_urls = extract_kvs_download_urls(html)
@@ -204,7 +191,7 @@ def _parse_pimpbunny_video_html(url: str, html: str, service: str = "pimpbunny")
 
     vid_id = None
     if download_urls:
-        idm = re.search(r"/(\d+)(?:_\d+p)?\.mp4", download_urls[0]["url"])
+        idm = re.search(r"/(\d+)(?:_[a-z]+)?(?:_\d+p)?\.mp4", download_urls[0]["url"])
         if idm:
             vid_id = idm.group(1)
 
@@ -262,7 +249,7 @@ def _parse_pimpbunny_listing_html(
 
         model = fallback_model
         if not model and parent:
-            m_link = parent.find("a", href=re.compile(r"/onlyfans-creators/[^/]+"))
+            m_link = parent.find("a", href=re.compile(r"/(?:onlyfans-creators|models)/[^/?#]+"))
             if m_link:
                 mparts = [p for p in urlparse(m_link["href"]).path.split("/") if p]
                 if len(mparts) >= 2:
@@ -280,12 +267,16 @@ def _parse_pimpbunny_listing_html(
         items.append(pimpbunny_to_video_dict(video, service=service))
 
     page_nums: set[int] = set()
-    base_path = urlparse(base_url).path.rstrip("/")
+    # Strip any trailing /<page> segment so pagination links on page 2+ still match
+    canonical_base_path = re.sub(r"/\d+$", "", urlparse(base_url).path.rstrip("/"))
     for a in soup.find_all("a", href=True):
         p_path = urlparse(urljoin(base_url, a["href"])).path.rstrip("/")
-        m = re.match(rf"^{re.escape(base_path)}/(\d+)$", p_path)
+        m = re.match(rf"^{re.escape(canonical_base_path)}/(\d+)$", p_path)
         if m:
             page_nums.add(int(m.group(1)))
+        am = re.match(r"^Go to page (\d+)$", (a.get("aria-label") or "").strip(), re.I)
+        if am:
+            page_nums.add(int(am.group(1)))
 
     return items, page_nums
 
@@ -380,9 +371,10 @@ async def fetch_pimpbunny_all_posts(
         )
         close_client = True
 
+    req_headers = _pimpbunny_headers(f"https://{domain}/")
     try:
         if post_id:
-            resp = await client.get(base_url)
+            resp = await client.get(base_url, headers=req_headers)
             if _is_bunny_shield_response(resp.status_code, resp.text):
                 raise RuntimeError(
                     f"PimpBunny returned HTTP {resp.status_code} (Bunny Shield anti-bot challenge) for {base_url}"
@@ -391,14 +383,16 @@ async def fetch_pimpbunny_all_posts(
             return [_parse_pimpbunny_video_html(str(resp.url), resp.text, service=service_name)]
 
         fallback_model = ""
-        if user_id.startswith("onlyfans-creators/"):
-            fallback_model = user_id.split("/", 1)[1].replace("-", " ").title()
+        if user_id.startswith(("onlyfans-creators/", "models/")):
+            fallback_model = user_id.split("/", 1)[1].split("/")[0].replace("-", " ").title()
 
         if page_range:
             start_p, end_p = page_range
         else:
-            start_p, end_p = 1, 20
+            start_p, end_p = 1, 50
 
+        parsed_base = urlparse(base_url)
+        query_suffix = f"?{parsed_base.query}" if parsed_base.query else ""
         clean_base = base_url.split("?")[0].rstrip("/")
         if clean_base == f"https://{domain}" or user_id == "home":
             clean_base = f"https://{domain}"
@@ -409,10 +403,13 @@ async def fetch_pimpbunny_all_posts(
         seen_ids: set[str] = set()
 
         for page_num in range(start_p, end_p + 1):
-            page_url = f"{clean_base}/" if page_num == 1 else f"{clean_base}/{page_num}/"
-            resp = await client.get(page_url)
+            page_url = (f"{clean_base}/" if page_num == 1 else f"{clean_base}/{page_num}/") + query_suffix
+            resp = await client.get(page_url, headers=req_headers)
             if _is_bunny_shield_response(resp.status_code, resp.text):
                 if items:
+                    logger.warning(
+                        f"PimpBunny returned HTTP {resp.status_code} (Bunny Shield anti-bot challenge) for {page_url}; returning {len(items)} fetched items."
+                    )
                     break
                 raise RuntimeError(
                     f"PimpBunny returned HTTP {resp.status_code} (Bunny Shield anti-bot challenge) for {page_url}"
